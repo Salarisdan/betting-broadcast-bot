@@ -12,6 +12,11 @@ from telegram.ext import (
 )
 from config import TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY, ANTHROPIC_MODEL, ALLOWED_USER_IDS, GROUPS_FILE, USERS_FILE
 import anthropic
+try:
+    from duckduckgo_search import DDGS
+    _DDG_AVAILABLE = True
+except ImportError:
+    _DDG_AVAILABLE = False
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -85,7 +90,37 @@ def is_allowed(user_id: int) -> bool:
         return True
     return user_id in _extra_user_ids(load_extra_users())
 
-# ─── Claude generation ────────────────────────────────────────────────────────
+# ─── Claude generation ─────────────────────────────────────────────────────
+
+async def search_web(query: str, max_results: int = 6) -> str:
+    """
+    Search DuckDuckGo for fresh data. Returns a formatted string of snippets,
+    or an empty string if unavailable / no results.
+    """
+    if not _DDG_AVAILABLE:
+        return ""
+
+    def _sync_search():
+        try:
+            results = DDGS().text(query, max_results=max_results)
+            return results or []
+        except Exception as exc:
+            logger.warning(f"DuckDuckGo search failed: {exc}")
+            return []
+
+    results = await asyncio.to_thread(_sync_search)
+    if not results:
+        return ""
+
+    lines = []
+    for r in results:
+        title = r.get("title", "").strip()
+        body = r.get("body", "").strip()
+        href = r.get("href", "").strip()
+        if title or body:
+            lines.append(f"• {title}\n  {body}\n  {href}")
+    return "\n\n".join(lines)
+
 
 async def call_claude(prompt: str, max_tokens: int = 2048) -> str:
     """Call Claude with a fully-formed prompt string."""
@@ -120,13 +155,15 @@ async def call_claude(prompt: str, max_tokens: int = 2048) -> str:
 
 
 async def generate_post_text(topic: str) -> str:
+    web_context = await search_web(f"{topic} betting tips 2026")
     system = (
         "Ты — эксперт по беттингу и гемблингу. Пишешь посты для Telegram.\n"
         "Правила:\n- Живой текст с характером, не сухой\n- Умеренные эмодзи\n"
         "- 150–300 слов\n- Разные форматы: советы, стратегии, факты, психология, аналитика\n"
         "- Не рекламируй конкретные бренды\n- Только русский язык\n- Без хэштегов"
     )
-    return await call_claude(f"{system}\n\nНапиши пост на тему: {topic}")
+    web_block = f"\n\nСвежие данные из интернета (используй как контекст):\n{web_context}" if web_context else ""
+    return await call_claude(f"{system}\n\nНапиши пост на тему: {topic}{web_block}")
 
 # ─── Keyboards ────────────────────────────────────────────────────────────────
 
@@ -1155,7 +1192,17 @@ async def msg_match_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❌ Введи данные матча.", reply_markup=back_kb("main_menu")
         )
         return MATCH_WAIT_DATA
-    msg = await update.message.reply_text("⏳ Генерирую анализ через Claude...")
+    msg = await update.message.reply_text("⏳ Ищу свежие данные и генерирую анализ...")
+
+    # Extract team names from first line for targeted search
+    first_line = raw.splitlines()[0].strip()
+    search_query = f"{first_line} match preview odds stats 2026"
+    web_context = await search_web(search_query, max_results=8)
+    web_block = (
+        f"\n\nСвежие данные из интернета по этому матчу (используй как контекст):\n{web_context}"
+        if web_context else ""
+    )
+
     prompt = (
         "Ты — профессиональный беттинговый аналитик. Составь детальный пост-анализ матча "
         "для Telegram-канала на русском языке.\n\n"
@@ -1172,7 +1219,7 @@ async def msg_match_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Длина 400–600 слов. Без хэштегов."
     )
     try:
-        result = await call_claude(prompt, max_tokens=2048)
+        result = await call_claude(prompt + web_block, max_tokens=2048)
         context.user_data["generated_post"] = {"text": result, "entities": None}
         await msg.edit_text(f"✅ Анализ готов:\n\n{result}", reply_markup=generated_post_kb())
         return GENERATE_READY
