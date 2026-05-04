@@ -503,8 +503,23 @@ def main():
                 CallbackQueryHandler(cb_main_menu, pattern="^main_menu$"),
             ],
         },
-        fallbacks=[CommandHandler("start", cmd_start)],
+        fallbacks=[
+            CommandHandler("start", cmd_start),
+            CallbackQueryHandler(cb_main_menu, pattern="^main_menu$"),
+            CallbackQueryHandler(cb_groups_menu, pattern="^groups_menu$"),
+            CallbackQueryHandler(cb_group_list, pattern="^group_list$"),
+            CallbackQueryHandler(cb_group_add, pattern="^group_add$"),
+            CallbackQueryHandler(cb_group_delete_list, pattern="^group_delete_list$"),
+            CallbackQueryHandler(cb_group_delete, pattern="^del_"),
+            CallbackQueryHandler(cb_broadcast_start, pattern="^broadcast_start$"),
+            CallbackQueryHandler(cb_generate_menu, pattern="^generate_menu$"),
+            CallbackQueryHandler(cb_select_group, pattern="^sel_(?!done)"),
+            CallbackQueryHandler(cb_select_done, pattern="^sel_done$"),
+            CallbackQueryHandler(cb_confirm_yes, pattern="^confirm_yes$"),
+        ],
         per_message=False,
+        per_chat=True,
+        per_user=True,
     )
 
     app.add_handler(conv)
