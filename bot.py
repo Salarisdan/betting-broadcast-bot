@@ -157,8 +157,11 @@ async def cb_group_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     await q.edit_message_text(
-        "Перешли любое сообщение из нужной группы/канала.\n\n"
-        "Или введи chat_id вручную (например: -1001234567890 или @username):",
+        "Отправь ссылку-приглашение в группу/канал.\n\n"
+        "Примеры:\n"
+        "https://t.me/+Bgtk-OaAiVs0NmVi\n"
+        "https://t.me/joinchat/XXXXXX\n"
+        "https://t.me/username",
         reply_markup=back_kb("groups_menu")
     )
     return ADD_GROUP_WAIT_ID
@@ -167,31 +170,33 @@ async def msg_add_group_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
 
-    chat_id = None
-    auto_name = ""
+    text = update.message.text.strip() if update.message.text else ""
 
-    if update.message.forward_origin:
-        origin = update.message.forward_origin
-        if hasattr(origin, "chat"):
-            chat_id = str(origin.chat.id)
-            auto_name = origin.chat.title or origin.chat.username or chat_id
+    # Проверяем что это ссылка Telegram
+    if not (text.startswith("https://t.me/") or text.startswith("http://t.me/")):
+        await update.message.reply_text(
+            "❌ Не распознал. Отправь ссылку вида:\nhttps://t.me/+XXXXXX"
+        )
+        return ADD_GROUP_WAIT_ID
 
-    if not chat_id:
-        text = update.message.text.strip() if update.message.text else ""
-        if text.lstrip("-").isdigit() or text.startswith("@"):
-            chat_id = text
-        else:
-            await update.message.reply_text("❌ Не распознал. Введи chat_id или @username")
-            return ADD_GROUP_WAIT_ID
-
-    context.user_data["new_group_id"] = chat_id
-    context.user_data["new_group_auto_name"] = auto_name
-    hint = f'\n(или нажми Enter чтобы оставить "{auto_name}")' if auto_name else ""
-    await update.message.reply_text(
-        f"ID: {chat_id}\nВведи название для этой группы:{hint}",
-        reply_markup=back_kb("groups_menu")
-    )
-    return ADD_GROUP_WAIT_NAME
+    wait_msg = await update.message.reply_text("⏳ Вступаю в группу...")
+    try:
+        chat = await context.bot.join_chat(text)
+        chat_id = str(chat.id)
+        name = chat.title or chat.username or chat_id
+        groups = load_groups()
+        groups[chat_id] = name
+        save_groups(groups)
+        await wait_msg.edit_text(f"✅ Группа добавлена: {name}", reply_markup=groups_menu_kb())
+        return MAIN_MENU
+    except Exception as e:
+        logger.error(f"join_chat error: {e}")
+        await wait_msg.edit_text(
+            f"❌ Не удалось вступить: {e}\n\n"
+            "Убедись что ссылка действующая и бот ещё не состоит в этой группе.",
+            reply_markup=back_kb("groups_menu")
+        )
+        return ADD_GROUP_WAIT_ID
 
 async def msg_add_group_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
@@ -201,7 +206,7 @@ async def msg_add_group_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
     groups = load_groups()
     groups[gid] = name
     save_groups(groups)
-    await update.message.reply_text(f"✅ Группа добавлена: *{name}*", parse_mode="Markdown", reply_markup=groups_menu_kb())
+    await update.message.reply_text(f"✅ Группа добавлена: {name}", reply_markup=groups_menu_kb())
     return MAIN_MENU
 
 async def cb_group_delete_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
