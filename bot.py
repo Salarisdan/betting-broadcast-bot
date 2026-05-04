@@ -93,17 +93,18 @@ def is_allowed(user_id: int) -> bool:
 
 # ─── Claude generation ─────────────────────────────────────────────────────
 
-async def search_web(query: str, max_results: int = 6) -> str:
+async def search_web(query: str, max_results: int = 6, timelimit: str = "w") -> str:
     """
     Search DuckDuckGo for fresh data. Returns a formatted string of snippets,
     or an empty string if unavailable / no results.
+    timelimit: "d"=day, "w"=week, "m"=month
     """
     if not _DDG_AVAILABLE:
         return ""
 
     def _sync_search():
         try:
-            results = DDGS().text(query, max_results=max_results)
+            results = DDGS().text(query, max_results=max_results, timelimit=timelimit)
             return results or []
         except Exception as exc:
             logger.warning(f"DuckDuckGo search failed: {exc}")
@@ -119,7 +120,7 @@ async def search_web(query: str, max_results: int = 6) -> str:
         body = r.get("body", "").strip()
         href = r.get("href", "").strip()
         if title or body:
-            lines.append(f"• {title}\n  {body}\n  {href}")
+            lines.append(f"[{title}]\n{body}\n{href}")
     return "\n\n".join(lines)
 
 
@@ -1178,12 +1179,12 @@ async def cb_proc_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── Sport news flow ─────────────────────────────────────────────────────────
 
 _SPORT_META = {
-    "football":   ("⚽ Футбол",      "football latest results scores goals 2026"),
-    "ufc":        ("🏆 UFC / MMA",   "UFC MMA latest fight results 2026"),
-    "hockey":     ("🏒 Хоккей",      "NHL hockey latest results scores 2026"),
-    "basketball": ("🏀 Баскетбол",   "NBA basketball latest results scores 2026"),
-    "tennis":     ("🎾 Теннис",      "tennis ATP WTA latest results scores 2026"),
-    "boxing":     ("🥊 Бокс",        "boxing latest fight results 2026"),
+    "football":   ("⚽ Футбол",      ["football results scores today", "футбол результаты матчей сегодня"]),
+    "ufc":        ("🏆 UFC / MMA",   ["UFC MMA fight results this week", "UFC MMA результаты боёв"]),
+    "hockey":     ("🏒 Хоккей",      ["NHL hockey results scores today", "хоккей НХЛ результаты матчей"]),
+    "basketball": ("🏀 Баскетбол",   ["NBA basketball results scores today", "НБА баскетбол результаты"]),
+    "tennis":     ("🎾 Теннис",      ["tennis ATP WTA results today", "теннис ATP WTA результаты"]),
+    "boxing":     ("🥊 Бокс",        ["boxing fight results this week", "бокс результаты боёв"]),
 }
 
 async def cb_sport_news_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1201,24 +1202,48 @@ async def cb_sport_news_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def _generate_sport_news(update: Update, context: ContextTypes.DEFAULT_TYPE, sport_key: str):
     q = update.callback_query
     await q.answer()
-    label, search_query = _SPORT_META[sport_key]
+    label, queries = _SPORT_META[sport_key]
     await q.edit_message_text(f"⏳ Ищу свежие новости по теме {label}...")
 
-    web_context = await search_web(search_query, max_results=10)
-    web_block = f"\n\nСвежие данные из интернета:\n{web_context}" if web_context else ""
-
     today = datetime.now().strftime("%d.%m.%Y")
+
+    # Run both queries (EN + RU) in parallel, timelimit=day first, fallback to week
+    async def fetch(query):
+        result = await search_web(query, max_results=8, timelimit="d")
+        if not result:
+            result = await search_web(query, max_results=8, timelimit="w")
+        return result
+
+    results = await asyncio.gather(*[fetch(q_str) for q_str in queries])
+    all_snippets = "\n\n".join(r for r in results if r)
+
+    if not all_snippets:
+        no_data_msg = (
+            f"❌ Не удалось найти свежие данные по теме «{label}».\n\n"
+            "DuckDuckGo не вернул актуальных результатов. "
+            "Попробуй позже или используй матч-анализ с ручным вводом данных."
+        )
+        await q.edit_message_text(no_data_msg, reply_markup=sport_news_kb())
+        return SPORT_NEWS_MENU
+
     prompt = (
-        f"Ты — спортивный журналист Telegram-канала по беттингу. "
-        f"Сегодня {today}. Напиши свежий новостной пост по теме «{label}» на русском языке.\n\n"
-        "Пост должен содержать:\n"
-        "- Заголовок с датой\n"
-        "- 3–5 самых важных результатов / матчей (счёт, победитель, кто забил/отличился)\n"
-        "- Короткий комментарий к каждому результату\n"
-        "- Что это значит для турнирной таблицы / плей-офф / дальнейших ставок\n"
-        "- Ближайшие топ-матчи которые стоит смотреть\n\n"
-        "Стиль: живой, динамичный, умеренные эмодзи. 250–400 слов. Без хэштегов."
-        f"{web_block}"
+        f"Сегодня {today}.\n\n"
+        "ДАННЫЕ ИЗ ИНТЕРНЕТА (свежие, за последние дни):\n"
+        "─────────────────────────────────────\n"
+        f"{all_snippets}\n"
+        "─────────────────────────────────────\n\n"
+        f"ЗАДАЧА: Напиши новостной пост для Telegram-канала по теме «{label}» на русском языке.\n\n"
+        "СТРОГИЕ ПРАВИЛА:\n"
+        "1. Используй ТОЛЬКО факты из данных выше — не придумывай результаты\n"
+        "2. Если данных нет по конкретному матчу — не упоминай его\n"
+        "3. Указывай точные счета и имена из источников\n"
+        "4. Пиши от имени аналитика который только что прочитал эти новости\n\n"
+        "СТРУКТУРА ПОСТА:\n"
+        f"- Заголовок: «{label} | {today}»\n"
+        "- 3–5 ключевых результатов из данных выше (счёт / победитель / подробности)\n"
+        "- Что это значит: турнирная таблица, плей-офф, ставки\n"
+        "- Ближайшие матчи на которые стоит обратить внимание\n\n"
+        "Стиль: живой, динамичный. Умеренные эмодзи. 250–400 слов. Без хэштегов."
     )
     try:
         result = await call_claude(prompt, max_tokens=2048)
