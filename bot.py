@@ -158,8 +158,7 @@ async def cb_group_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     await q.edit_message_text(
         "Перешли любое сообщение из нужной группы/канала.\n\n"
-        "Или введи chat_id вручную (например: `-1001234567890` или `@username`):",
-        parse_mode="Markdown",
+        "Или введи chat_id вручную (например: -1001234567890 или @username):",
         reply_markup=back_kb("groups_menu")
     )
     return ADD_GROUP_WAIT_ID
@@ -189,8 +188,7 @@ async def msg_add_group_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_group_auto_name"] = auto_name
     hint = f'\n(или нажми Enter чтобы оставить "{auto_name}")' if auto_name else ""
     await update.message.reply_text(
-        f"ID: `{chat_id}`\nВведи название для этой группы:{hint}",
-        parse_mode="Markdown",
+        f"ID: {chat_id}\nВведи название для этой группы:{hint}",
         reply_markup=back_kb("groups_menu")
     )
     return ADD_GROUP_WAIT_NAME
