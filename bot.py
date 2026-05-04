@@ -10,7 +10,7 @@ from telegram.ext import (
     MessageHandler, ContextTypes, ConversationHandler, filters,
     ChatMemberHandler
 )
-from config import TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY, ALLOWED_USER_IDS, GROUPS_FILE
+from config import TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY, ALLOWED_USER_IDS, GROUPS_FILE, USERS_FILE
 import anthropic
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -27,7 +27,8 @@ anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     BROADCAST_WAIT_TIME, BROADCAST_PICK_DATE,
     BROADCAST_PICK_HOUR, BROADCAST_PICK_MINUTE, BROADCAST_CONFIRM,
     GENERATE_WAIT_TOPIC,
-) = range(13)
+    ADD_USER_WAIT_ID,
+) = range(14)
 
 # ─── Groups storage ───────────────────────────────────────────────────────────
 
@@ -41,12 +42,34 @@ def save_groups(groups: dict):
     with open(GROUPS_FILE, "w", encoding="utf-8") as f:
         json.dump(groups, f, ensure_ascii=False, indent=2)
 
+# ─── Users storage ────────────────────────────────────────────────────────────
+
+def load_extra_users() -> list:
+    """Load user IDs added via bot (stored in USERS_FILE)."""
+    if os.path.exists(USERS_FILE):
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+def save_extra_users(users: list):
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(users, f, ensure_ascii=False, indent=2)
+
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 
-def is_allowed(user_id: int) -> bool:
+def is_owner(user_id: int) -> bool:
+    """Only env-configured users are owners (can manage access)."""
     if not ALLOWED_USER_IDS:
         return True
     return user_id in ALLOWED_USER_IDS
+
+def is_allowed(user_id: int) -> bool:
+    """Owners + extra users added via bot."""
+    if not ALLOWED_USER_IDS:
+        return True
+    if user_id in ALLOWED_USER_IDS:
+        return True
+    return user_id in load_extra_users()
 
 # ─── Claude generation ────────────────────────────────────────────────────────
 
@@ -71,12 +94,28 @@ async def generate_post_text(topic: str) -> str:
 
 # ─── Keyboards ────────────────────────────────────────────────────────────────
 
-def main_menu_kb():
-    return InlineKeyboardMarkup([
+def main_menu_kb(owner: bool = False):
+    rows = [
         [InlineKeyboardButton("📤 Создать рассылку", callback_data="broadcast_start")],
         [InlineKeyboardButton("👥 Управление группами", callback_data="groups_menu")],
         [InlineKeyboardButton("✏️ Сгенерировать пост", callback_data="generate_menu")],
+    ]
+    if owner:
+        rows.append([InlineKeyboardButton("🔑 Управление доступом", callback_data="users_menu")])
+    return InlineKeyboardMarkup(rows)
+
+def users_menu_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Добавить пользователя", callback_data="user_add")],
+        [InlineKeyboardButton("➖ Удалить пользователя", callback_data="user_delete_list")],
+        [InlineKeyboardButton("📋 Список пользователей", callback_data="user_list")],
+        [InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu")],
     ])
+
+def delete_users_kb(users: list):
+    buttons = [[InlineKeyboardButton(f"🗑 {uid}", callback_data=f"delusr_{uid}")] for uid in users]
+    buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="users_menu")])
+    return InlineKeyboardMarkup(buttons)
 
 def groups_menu_kb():
     return InlineKeyboardMarkup([
@@ -195,9 +234,11 @@ def build_broadcast_summary(data: dict, groups: dict, delay_seconds: float, send
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
+        await update.message.reply_text("⛔ У тебя нет доступа к этому боту.")
         return
     context.user_data.clear()
-    await update.message.reply_text("👋 Бот для рассылки постов в группы", reply_markup=main_menu_kb())
+    owner = is_owner(update.effective_user.id)
+    await update.message.reply_text("👋 Бот для рассылки постов в группы", reply_markup=main_menu_kb(owner))
     return MAIN_MENU
 
 async def cmd_register_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -232,7 +273,8 @@ async def cb_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     context.user_data.clear()
-    await q.edit_message_text("Главное меню:", reply_markup=main_menu_kb())
+    owner = is_owner(update.effective_user.id)
+    await q.edit_message_text("Главное меню:", reply_markup=main_menu_kb(owner))
     return MAIN_MENU
 
 async def cb_groups_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -369,6 +411,87 @@ async def cb_group_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = groups.pop(gid, gid)
     save_groups(groups)
     await q.edit_message_text(f"🗑 Удалено: {name}", reply_markup=groups_menu_kb())
+    return MAIN_MENU
+
+# ─── Callbacks: users management ─────────────────────────────────────────────
+
+async def cb_users_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not is_owner(update.effective_user.id):
+        await q.answer("⛔ Только владелец может управлять доступом.", show_alert=True)
+        return MAIN_MENU
+    await q.edit_message_text("🔑 Управление доступом:", reply_markup=users_menu_kb())
+    return MAIN_MENU
+
+async def cb_user_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not is_owner(update.effective_user.id):
+        return MAIN_MENU
+    owners = [str(uid) for uid in ALLOWED_USER_IDS]
+    extra = [str(uid) for uid in load_extra_users()]
+    lines = [f"👑 {uid} (владелец)" for uid in owners] + [f"👤 {uid}" for uid in extra]
+    text = "📋 Пользователи:\n\n" + "\n".join(lines) if lines else "Нет пользователей"
+    await q.edit_message_text(text, reply_markup=users_menu_kb())
+    return MAIN_MENU
+
+async def cb_user_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not is_owner(update.effective_user.id):
+        return MAIN_MENU
+    await q.edit_message_text(
+        "👤 Добавить пользователя\n\n"
+        "Отправь Telegram ID нового пользователя.\n"
+        "Его ID можно узнать через @userinfobot.",
+        reply_markup=back_kb("users_menu")
+    )
+    return ADD_USER_WAIT_ID
+
+async def msg_add_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        return
+    text = update.message.text.strip() if update.message.text else ""
+    if not text.lstrip("-").isdigit():
+        await update.message.reply_text("❌ Введи числовой Telegram ID", reply_markup=back_kb("users_menu"))
+        return ADD_USER_WAIT_ID
+    new_uid = int(text)
+    if new_uid in ALLOWED_USER_IDS:
+        await update.message.reply_text("ℹ️ Этот пользователь уже владелец.", reply_markup=users_menu_kb())
+        return MAIN_MENU
+    users = load_extra_users()
+    if new_uid in users:
+        await update.message.reply_text("ℹ️ Этот пользователь уже добавлен.", reply_markup=users_menu_kb())
+        return MAIN_MENU
+    users.append(new_uid)
+    save_extra_users(users)
+    await update.message.reply_text(f"✅ Пользователь {new_uid} добавлен.", reply_markup=users_menu_kb())
+    return MAIN_MENU
+
+async def cb_user_delete_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not is_owner(update.effective_user.id):
+        return MAIN_MENU
+    users = load_extra_users()
+    if not users:
+        await q.edit_message_text("Нет добавленных пользователей.", reply_markup=users_menu_kb())
+        return MAIN_MENU
+    await q.edit_message_text("Выбери пользователя для удаления:", reply_markup=delete_users_kb(users))
+    return MAIN_MENU
+
+async def cb_user_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not is_owner(update.effective_user.id):
+        return MAIN_MENU
+    uid = int(q.data.replace("delusr_", ""))
+    users = load_extra_users()
+    if uid in users:
+        users.remove(uid)
+        save_extra_users(users)
+    await q.edit_message_text(f"🗑 Пользователь {uid} удалён.", reply_markup=users_menu_kb())
     return MAIN_MENU
 
 # ─── Broadcast flow ───────────────────────────────────────────────────────────
@@ -727,18 +850,13 @@ def main():
             CallbackQueryHandler(cb_select_group, pattern="^sel_(?!done)"),
             CallbackQueryHandler(cb_select_done, pattern="^sel_done$"),
             CallbackQueryHandler(cb_confirm_yes, pattern="^confirm_yes$"),
+            CallbackQueryHandler(cb_users_menu, pattern="^users_menu$"),
+            CallbackQueryHandler(cb_user_list, pattern="^user_list$"),
+            CallbackQueryHandler(cb_user_add, pattern="^user_add$"),
+            CallbackQueryHandler(cb_user_delete_list, pattern="^user_delete_list$"),
+            CallbackQueryHandler(cb_user_delete, pattern="^delusr_"),
         ],
         states={
-            MAIN_MENU: [
-                CallbackQueryHandler(cb_main_menu, pattern="^main_menu$"),
-                CallbackQueryHandler(cb_groups_menu, pattern="^groups_menu$"),
-                CallbackQueryHandler(cb_group_list, pattern="^group_list$"),
-                CallbackQueryHandler(cb_group_add, pattern="^group_add$"),
-                CallbackQueryHandler(cb_group_delete_list, pattern="^group_delete_list$"),
-                CallbackQueryHandler(cb_group_delete, pattern="^del_"),
-                CallbackQueryHandler(cb_broadcast_start, pattern="^broadcast_start$"),
-                CallbackQueryHandler(cb_generate_menu, pattern="^generate_menu$"),
-            ],
             ADD_GROUP_WAIT_ID: [
                 MessageHandler(filters.ALL & ~filters.COMMAND, msg_add_group_id),
                 CallbackQueryHandler(cb_groups_menu, pattern="^groups_menu$"),
@@ -794,6 +912,26 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, msg_generate_topic),
                 CallbackQueryHandler(cb_main_menu, pattern="^main_menu$"),
             ],
+            ADD_USER_WAIT_ID: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, msg_add_user_id),
+                CallbackQueryHandler(cb_users_menu, pattern="^users_menu$"),
+                CallbackQueryHandler(cb_main_menu, pattern="^main_menu$"),
+            ],
+            MAIN_MENU: [
+                CallbackQueryHandler(cb_main_menu, pattern="^main_menu$"),
+                CallbackQueryHandler(cb_groups_menu, pattern="^groups_menu$"),
+                CallbackQueryHandler(cb_group_list, pattern="^group_list$"),
+                CallbackQueryHandler(cb_group_add, pattern="^group_add$"),
+                CallbackQueryHandler(cb_group_delete_list, pattern="^group_delete_list$"),
+                CallbackQueryHandler(cb_group_delete, pattern="^del_"),
+                CallbackQueryHandler(cb_broadcast_start, pattern="^broadcast_start$"),
+                CallbackQueryHandler(cb_generate_menu, pattern="^generate_menu$"),
+                CallbackQueryHandler(cb_users_menu, pattern="^users_menu$"),
+                CallbackQueryHandler(cb_user_list, pattern="^user_list$"),
+                CallbackQueryHandler(cb_user_add, pattern="^user_add$"),
+                CallbackQueryHandler(cb_user_delete_list, pattern="^user_delete_list$"),
+                CallbackQueryHandler(cb_user_delete, pattern="^delusr_"),
+            ],
         },
         fallbacks=[
             CommandHandler("start", cmd_start),
@@ -816,6 +954,11 @@ def main():
             CallbackQueryHandler(cb_pick_hour, pattern="^pick_hour_"),
             CallbackQueryHandler(cb_pick_minute, pattern="^pick_min_"),
             CallbackQueryHandler(cb_confirm_yes, pattern="^confirm_yes$"),
+            CallbackQueryHandler(cb_users_menu, pattern="^users_menu$"),
+            CallbackQueryHandler(cb_user_list, pattern="^user_list$"),
+            CallbackQueryHandler(cb_user_add, pattern="^user_add$"),
+            CallbackQueryHandler(cb_user_delete_list, pattern="^user_delete_list$"),
+            CallbackQueryHandler(cb_user_delete, pattern="^delusr_"),
         ],
         per_message=False,
         per_chat=True,
