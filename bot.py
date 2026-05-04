@@ -124,6 +124,43 @@ async def search_web(query: str, max_results: int = 6, timelimit: str = "w") -> 
     return "\n\n".join(lines)
 
 
+async def search_news(query: str, max_results: int = 10) -> str:
+    """
+    Search DuckDuckGo News — returns real recent news articles with publish dates.
+    Much more reliable for sports results than text search.
+    """
+    if not _DDG_AVAILABLE:
+        return ""
+
+    def _sync_search():
+        try:
+            results = DDGS().news(query, max_results=max_results)
+            return results or []
+        except Exception as exc:
+            logger.warning(f"DuckDuckGo news search failed: {exc}")
+            return []
+
+    results = await asyncio.to_thread(_sync_search)
+    if not results:
+        return ""
+
+    lines = []
+    for r in results:
+        title = r.get("title", "").strip()
+        body = r.get("body", "").strip()
+        date = r.get("date", "").strip()
+        source = r.get("source", "").strip()
+        url = r.get("url", "").strip()
+        if title:
+            line = f"[{date}] {source}: {title}"
+            if body:
+                line += f"\n  {body}"
+            if url:
+                line += f"\n  {url}"
+            lines.append(line)
+    return "\n\n".join(lines)
+
+
 async def call_claude(prompt: str, max_tokens: int = 2048) -> str:
     """Call Claude with a fully-formed prompt string."""
     global RESOLVED_ANTHROPIC_MODEL
@@ -1179,12 +1216,12 @@ async def cb_proc_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── Sport news flow ─────────────────────────────────────────────────────────
 
 _SPORT_META = {
-    "football":   ("⚽ Футбол",      ["football results scores today", "футбол результаты матчей сегодня"]),
-    "ufc":        ("🏆 UFC / MMA",   ["UFC MMA fight results this week", "UFC MMA результаты боёв"]),
-    "hockey":     ("🏒 Хоккей",      ["NHL hockey results scores today", "хоккей НХЛ результаты матчей"]),
-    "basketball": ("🏀 Баскетбол",   ["NBA basketball results scores today", "НБА баскетбол результаты"]),
-    "tennis":     ("🎾 Теннис",      ["tennis ATP WTA results today", "теннис ATP WTA результаты"]),
-    "boxing":     ("🥊 Бокс",        ["boxing fight results this week", "бокс результаты боёв"]),
+    "football":   ("⚽ Футбол",      ["football results scores today", "soccer results today Premier League LaLiga Serie A"]),
+    "ufc":        ("🏆 UFC / MMA",   ["UFC MMA results this week", "UFC fight night results"]),
+    "hockey":     ("🏒 Хоккей",      ["NHL hockey results today", "NHL scores tonight"]),
+    "basketball": ("🏀 Баскетбол",   ["NBA basketball results today", "NBA scores tonight"]),
+    "tennis":     ("🎾 Теннис",      ["tennis results today ATP WTA", "tennis scores today"]),
+    "boxing":     ("🥊 Бокс",        ["boxing results this week", "boxing fight results"]),
 }
 
 async def cb_sport_news_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1207,43 +1244,37 @@ async def _generate_sport_news(update: Update, context: ContextTypes.DEFAULT_TYP
 
     today = datetime.now().strftime("%d.%m.%Y")
 
-    # Run both queries (EN + RU) in parallel, timelimit=day first, fallback to week
-    async def fetch(query):
-        result = await search_web(query, max_results=8, timelimit="d")
-        if not result:
-            result = await search_web(query, max_results=8, timelimit="w")
-        return result
-
-    results = await asyncio.gather(*[fetch(q_str) for q_str in queries])
-    all_snippets = "\n\n".join(r for r in results if r)
+    # Run all queries via news search in parallel
+    news_results = await asyncio.gather(*[search_news(q_str, max_results=8) for q_str in queries])
+    all_snippets = "\n\n".join(r for r in news_results if r)
 
     if not all_snippets:
-        no_data_msg = (
-            f"❌ Не удалось найти свежие данные по теме «{label}».\n\n"
-            "DuckDuckGo не вернул актуальных результатов. "
-            "Попробуй позже или используй матч-анализ с ручным вводом данных."
+        await q.edit_message_text(
+            f"❌ Не нашёл свежих новостей по теме «{label}».\n\n"
+            "Попробуй позже — возможно, матчей сегодня нет или источники временно недоступны.",
+            reply_markup=sport_news_kb(),
         )
-        await q.edit_message_text(no_data_msg, reply_markup=sport_news_kb())
         return SPORT_NEWS_MENU
 
     prompt = (
         f"Сегодня {today}.\n\n"
-        "ДАННЫЕ ИЗ ИНТЕРНЕТА (свежие, за последние дни):\n"
-        "─────────────────────────────────────\n"
+        "НОВОСТИ ИЗ ИНТЕРНЕТА (свежие статьи с датами публикации):\n"
+        "═══════════════════════════════════════\n"
         f"{all_snippets}\n"
-        "─────────────────────────────────────\n\n"
+        "═══════════════════════════════════════\n\n"
         f"ЗАДАЧА: Напиши новостной пост для Telegram-канала по теме «{label}» на русском языке.\n\n"
-        "СТРОГИЕ ПРАВИЛА:\n"
-        "1. Используй ТОЛЬКО факты из данных выше — не придумывай результаты\n"
-        "2. Если данных нет по конкретному матчу — не упоминай его\n"
-        "3. Указывай точные счета и имена из источников\n"
-        "4. Пиши от имени аналитика который только что прочитал эти новости\n\n"
-        "СТРУКТУРА ПОСТА:\n"
+        "ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА:\n"
+        "1. Используй ТОЛЬКО факты из новостей выше. Никакой отсебятины\n"
+        "2. Все результаты, имена и счета — строго из источников выше\n"
+        "3. Если в источниках нет конкретного матча — не упоминай его\n"
+        "4. Указывай источник или дату публикации где это уместно\n"
+        "5. Если информация устарела (старше 3 дней) — предупреди об этом\n\n"
+        "СТРУКТУРА:\n"
         f"- Заголовок: «{label} | {today}»\n"
-        "- 3–5 ключевых результатов из данных выше (счёт / победитель / подробности)\n"
-        "- Что это значит: турнирная таблица, плей-офф, ставки\n"
-        "- Ближайшие матчи на которые стоит обратить внимание\n\n"
-        "Стиль: живой, динамичный. Умеренные эмодзи. 250–400 слов. Без хэштегов."
+        "- 3–5 ключевых результатов из новостей выше\n"
+        "- Краткий анализ: что значит для таблицы / ставок\n"
+        "- Ближайшие события\n\n"
+        "Стиль: живой, умеренные эмодзи. 250–400 слов. Без хэштегов."
     )
     try:
         result = await call_claude(prompt, max_tokens=2048)
