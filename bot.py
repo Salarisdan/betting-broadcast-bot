@@ -10,13 +10,14 @@ from telegram.ext import (
     MessageHandler, ContextTypes, ConversationHandler, filters,
     ChatMemberHandler
 )
-from config import TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY, ALLOWED_USER_IDS, GROUPS_FILE, USERS_FILE
+from config import TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY, ANTHROPIC_MODEL, ALLOWED_USER_IDS, GROUPS_FILE, USERS_FILE
 import anthropic
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+RESOLVED_ANTHROPIC_MODEL = ANTHROPIC_MODEL
 
 # ─── States ───────────────────────────────────────────────────────────────────
 (
@@ -94,13 +95,36 @@ SYSTEM_PROMPT = """Ты — эксперт по беттингу и гембли
 - Без хэштегов"""
 
 async def generate_post_text(topic: str) -> str:
-    message = anthropic_client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=1024,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": f"Напиши пост на тему: {topic}"}]
-    )
-    return message.content[0].text
+    global RESOLVED_ANTHROPIC_MODEL
+
+    candidate_models = [
+        RESOLVED_ANTHROPIC_MODEL,
+        "claude-sonnet-4-6",
+        "claude-haiku-4-5",
+        "claude-opus-4-7",
+    ]
+
+    last_error = None
+    for model_name in dict.fromkeys(candidate_models):
+        try:
+            message = anthropic_client.messages.create(
+                model=model_name,
+                max_tokens=1024,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": f"Напиши пост на тему: {topic}"}]
+            )
+            RESOLVED_ANTHROPIC_MODEL = model_name
+            return message.content[0].text
+        except Exception as e:
+            last_error = e
+            error_text = str(e)
+            # If the model name is invalid in this account, try the next known alias.
+            if "not_found_error" in error_text or "model:" in error_text:
+                logger.warning(f"Anthropic model unavailable: {model_name}")
+                continue
+            raise
+
+    raise RuntimeError(f"Не удалось подобрать рабочую модель Claude: {last_error}")
 
 # ─── Keyboards ────────────────────────────────────────────────────────────────
 

@@ -6,6 +6,10 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 # Anthropic API Key из console.anthropic.com
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
+# Модель Claude для генерации постов
+# Можно переопределить в Railway переменной ANTHROPIC_MODEL
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+
 # Путь к файлу с группами (Railway сохраняет между рестартами если volume подключен)
 GROUPS_FILE = os.environ.get("GROUPS_FILE", "/data/groups.json")
 
