@@ -458,9 +458,10 @@ async def cb_user_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return MAIN_MENU
     await q.edit_message_text(
         "👤 Добавить пользователя\n\n"
-        "Отправь @юзернейм пользователя.\n\n"
-        "⚠️ Важно: пользователь должен сначала написать боту /start,\n"
-        "иначе Telegram не позволит найти его ID.",
+        "Перешли сюда любое сообщение от нужного человека.\n\n"
+        "Как переслать:\n"
+        "1. Найди любое сообщение от этого человека\n"
+        "2. Нажми на него → Переслать → выбери этот бот",
         reply_markup=back_kb("users_menu")
     )
     return ADD_USER_WAIT_ID
@@ -468,39 +469,49 @@ async def cb_user_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def msg_add_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         return
-    text = update.message.text.strip() if update.message.text else ""
 
-    # Ensure it looks like a username
-    username = text if text.startswith("@") else f"@{text}"
+    new_uid = None
+    display = None
 
-    wait = await update.message.reply_text("⏳ Ищу пользователя...")
-    try:
-        chat = await context.bot.get_chat(username)
-    except Exception:
-        await wait.edit_text(
-            f"❌ Не нашёл пользователя {username}.\n\n"
-            "Убедись что:\n"
-            "1. Юзернейм введён правильно\n"
-            "2. Пользователь хоть раз написал /start этому боту",
+    # Try forwarded message first
+    if update.message.forward_origin:
+        origin = update.message.forward_origin
+        # ForwardOriginUser
+        if hasattr(origin, "sender_user") and origin.sender_user:
+            user = origin.sender_user
+            new_uid = user.id
+            display = user.full_name or user.username or str(user.id)
+        # ForwardOriginHiddenUser (privacy setting on)
+        elif hasattr(origin, "sender_user_name"):
+            await update.message.reply_text(
+                "❌ Этот пользователь скрыл свой аккаунт при пересыле.\n"
+                "Попроси его отключить «Кто может видеть мой аккаунт при пересылке» "
+                "в настройках конфиденциальности.",
+                reply_markup=back_kb("users_menu")
+            )
+            return ADD_USER_WAIT_ID
+
+    if not new_uid:
+        await update.message.reply_text(
+            "❌ Перешли сообщение от человека, которого хочешь добавить.\n\n"
+            "Нажми на любое его сообщение → Переслать → выбери этот бот.",
             reply_markup=back_kb("users_menu")
         )
         return ADD_USER_WAIT_ID
 
-    new_uid = chat.id
-    display = chat.full_name or chat.username or str(new_uid)
-
     if new_uid in ALLOWED_USER_IDS:
-        await wait.edit_text(f"ℹ️ {display} уже является владельцем.", reply_markup=users_menu_kb())
+        await update.message.reply_text(f"ℹ️ {display} уже является владельцем.", reply_markup=users_menu_kb())
         return MAIN_MENU
+
     users = load_extra_users()
-    # users stored as list of [uid, display_name] pairs
     existing_ids = [u[0] if isinstance(u, list) else u for u in users]
     if new_uid in existing_ids:
-        await wait.edit_text(f"ℹ️ {display} уже добавлен.", reply_markup=users_menu_kb())
+        await update.message.reply_text(f"ℹ️ {display} уже добавлен.", reply_markup=users_menu_kb())
         return MAIN_MENU
+
     users.append([new_uid, display])
     save_extra_users(users)
-    await wait.edit_text(f"✅ {display} ({username}) добавлен.", reply_markup=users_menu_kb())
+    await update.message.reply_text(f"✅ {display} добавлен.", reply_markup=users_menu_kb())
     return MAIN_MENU
 
 async def cb_user_delete_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -946,7 +957,7 @@ def main():
                 CallbackQueryHandler(cb_main_menu, pattern="^main_menu$"),
             ],
             ADD_USER_WAIT_ID: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, msg_add_user_id),
+                MessageHandler(filters.ALL & ~filters.COMMAND, msg_add_user_id),
                 CallbackQueryHandler(cb_users_menu, pattern="^users_menu$"),
                 CallbackQueryHandler(cb_main_menu, pattern="^main_menu$"),
             ],
