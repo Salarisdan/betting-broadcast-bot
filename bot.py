@@ -23,13 +23,14 @@ RESOLVED_ANTHROPIC_MODEL = ANTHROPIC_MODEL
 (
     MAIN_MENU,
     ADD_GROUP_WAIT_ID, ADD_GROUP_WAIT_NAME,
-    BROADCAST_SELECT_GROUPS, BROADCAST_WAIT_APK,
+    BROADCAST_SELECT_GROUPS, BROADCAST_CHOOSE_CONTENT,
+    BROADCAST_CHOOSE_ATTACHMENT, BROADCAST_WAIT_APK,
     BROADCAST_WAIT_TEXT, BROADCAST_WAIT_COUNT,
     BROADCAST_WAIT_TIME, BROADCAST_PICK_DATE,
     BROADCAST_PICK_HOUR, BROADCAST_PICK_MINUTE, BROADCAST_CONFIRM,
-    GENERATE_WAIT_TOPIC,
+    GENERATE_WAIT_TOPIC, GENERATE_READY,
     ADD_USER_WAIT_ID,
-) = range(14)
+) = range(17)
 
 # ─── Groups storage ───────────────────────────────────────────────────────────
 
@@ -190,6 +191,27 @@ def confirm_kb():
         InlineKeyboardButton("❌ Отмена", callback_data="main_menu"),
     ]])
 
+def content_mode_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✍️ Написать свой текст", callback_data="content_manual")],
+        [InlineKeyboardButton("🤖 Сгенерировать через Claude", callback_data="content_generate")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="broadcast_start")],
+    ])
+
+def attachment_choice_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📎 Прикрепить APK/файл", callback_data="attach_yes")],
+        [InlineKeyboardButton("➡️ Без файла", callback_data="attach_no")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="broadcast_start")],
+    ])
+
+def generated_post_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 Отправить в группы", callback_data="generated_send")],
+        [InlineKeyboardButton("🔁 Сгенерировать ещё", callback_data="generate_menu")],
+        [InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu")],
+    ])
+
 def schedule_time_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🚀 Сейчас", callback_data="time_now")],
@@ -269,6 +291,19 @@ def build_broadcast_summary(data: dict, groups: dict, delay_seconds: float, send
         f"⏰ Время: {time_str}\n\n"
         f"📝 Текст:\n{preview}"
     )
+
+async def ask_for_attachment(target, edit: bool = False):
+    text = (
+        "📎 *Нужен ли файл к посту?*\n\n"
+        "Подсказка: можешь отправить пост без APK, либо прикрепить файл отдельно."
+    )
+    if edit:
+        await target.edit_message_text(text, parse_mode="Markdown", reply_markup=attachment_choice_kb())
+    else:
+        await target.reply_text(text, parse_mode="Markdown", reply_markup=attachment_choice_kb())
+
+async def ask_for_count(target):
+    await target.reply_text("Сколько раз отправить пост в каждую группу? (введи число):")
 
 # ─── /start ───────────────────────────────────────────────────────────────────
 
@@ -607,11 +642,54 @@ async def cb_select_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not data.get("selected"):
         await q.answer("⚠️ Выбери хотя бы одну группу!", show_alert=True)
         return BROADCAST_SELECT_GROUPS
+    if data.get("post_text"):
+        await ask_for_attachment(q, edit=True)
+        return BROADCAST_CHOOSE_ATTACHMENT
     await q.edit_message_text(
-        "📎 Загрузи APK-файл — отправь его в этот чат:",
+        "📝 *Как подготовить текст поста?*\n\n"
+        "Подсказка: можешь написать текст сам или сгенерировать его через Claude.",
+        parse_mode="Markdown",
+        reply_markup=content_mode_kb(),
+    )
+    return BROADCAST_CHOOSE_CONTENT
+
+async def cb_content_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "✏️ Напиши текст поста одним сообщением.",
+        reply_markup=back_kb("broadcast_start")
+    )
+    return BROADCAST_WAIT_TEXT
+
+async def cb_content_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "🤖 Введи тему для генерации поста через Claude.",
+        reply_markup=back_kb("broadcast_start")
+    )
+    context.user_data["generate_for_broadcast"] = True
+    return GENERATE_WAIT_TOPIC
+
+async def cb_attach_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "📎 Загрузи APK-файл или другой document в этот чат:",
         reply_markup=back_kb("broadcast_start")
     )
     return BROADCAST_WAIT_APK
+
+async def cb_attach_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = get_bd(context)
+    data["apk_file_id"] = None
+    data["apk_name"] = None
+    await q.edit_message_text("✅ Пост будет отправлен без файла.")
+    await ask_for_count(q.message)
+    return BROADCAST_WAIT_COUNT
 
 async def msg_receive_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
@@ -626,7 +704,7 @@ async def msg_receive_apk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ Файл принят: `{doc.file_name}`\n\n"
         "✏️ Напиши текст поста.\n\n"
-        "Или отправь `/gen <тема>` чтобы сгенерировать через Claude:",
+        "Или вернись и выбери генерацию через Claude.",
         parse_mode="Markdown"
     )
     return BROADCAST_WAIT_TEXT
@@ -644,11 +722,9 @@ async def msg_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data = get_bd(context)
             data["post_text"] = generated
             data["post_entities"] = None
-            await msg.edit_text(
-                f"✅ Готово:\n\n{generated}\n\n"
-                "Сколько раз отправить в каждую группу? (введи число):"
-            )
-            return BROADCAST_WAIT_COUNT
+            await msg.edit_text(f"✅ Готово:\n\n{generated}")
+            await ask_for_attachment(update.message)
+            return BROADCAST_CHOOSE_ATTACHMENT
         except Exception as e:
             await msg.edit_text(f"❌ Ошибка: {e}")
             return BROADCAST_WAIT_TEXT
@@ -657,8 +733,8 @@ async def msg_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data["post_text"] = text
     # Preserve inline entities from Telegram editor (e.g. attached links)
     data["post_entities"] = tuple(update.message.entities) if update.message.entities else None
-    await update.message.reply_text("Сколько раз отправить пост в каждую группу? (введи число):")
-    return BROADCAST_WAIT_COUNT
+    await ask_for_attachment(update.message)
+    return BROADCAST_CHOOSE_ATTACHMENT
 
 async def msg_receive_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
@@ -859,12 +935,19 @@ async def cb_confirm_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for gid in data["selected"]:
         for _ in range(data["count"]):
             try:
-                await bot.send_document(
-                    chat_id=gid,
-                    document=data["apk_file_id"],
-                    caption=data["post_text"],
-                    caption_entities=data.get("post_entities"),
-                )
+                if data.get("apk_file_id"):
+                    await bot.send_document(
+                        chat_id=gid,
+                        document=data["apk_file_id"],
+                        caption=data["post_text"],
+                        caption_entities=data.get("post_entities"),
+                    )
+                else:
+                    await bot.send_message(
+                        chat_id=gid,
+                        text=data["post_text"],
+                        entities=data.get("post_entities"),
+                    )
                 sent += 1
                 await asyncio.sleep(1)
             except Exception as e:
@@ -885,6 +968,7 @@ async def cb_confirm_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cb_generate_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    context.user_data["generate_for_broadcast"] = False
     await q.edit_message_text(
         "✏️ Введи тему для генерации поста:",
         reply_markup=back_kb("main_menu")
@@ -898,10 +982,47 @@ async def msg_generate_topic(update: Update, context: ContextTypes.DEFAULT_TYPE)
     msg = await update.message.reply_text("⏳ Генерирую через Claude...")
     try:
         text = await generate_post_text(topic)
-        await msg.edit_text(f"✅ Готово:\n\n{text}", reply_markup=main_menu_kb())
+        if context.user_data.get("generate_for_broadcast"):
+            data = get_bd(context)
+            data["post_text"] = text
+            data["post_entities"] = None
+            context.user_data["generate_for_broadcast"] = False
+            await msg.edit_text(f"✅ Готово:\n\n{text}")
+            await update.message.reply_text(
+                "📎 Теперь выбери: отправлять с файлом или без файла.",
+                reply_markup=attachment_choice_kb(),
+            )
+            return BROADCAST_CHOOSE_ATTACHMENT
+
+        context.user_data["generated_post"] = {"text": text, "entities": None}
+        await msg.edit_text(f"✅ Готово:\n\n{text}", reply_markup=generated_post_kb())
+        return GENERATE_READY
     except Exception as e:
         await msg.edit_text(f"❌ Ошибка: {e}", reply_markup=main_menu_kb())
     return MAIN_MENU
+
+async def cb_generated_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    generated = context.user_data.get("generated_post")
+    if not generated:
+        await q.edit_message_text("❌ Сначала сгенерируй пост.", reply_markup=main_menu_kb(is_owner(update.effective_user.id)))
+        return MAIN_MENU
+    groups = load_groups()
+    if not groups:
+        await q.edit_message_text(
+            "❌ Нет сохраненных групп.\n\n"
+            "Сначала добавь группу, потом отправь сгенерированный пост.",
+            reply_markup=groups_menu_kb(),
+        )
+        return MAIN_MENU
+    context.user_data["broadcast"] = {
+        "selected": set(),
+        "post_text": generated["text"],
+        "post_entities": generated.get("entities"),
+    }
+    await q.edit_message_text("Выбери группы для рассылки:", reply_markup=select_groups_kb(groups, set()))
+    return BROADCAST_SELECT_GROUPS
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
@@ -942,6 +1063,18 @@ def main():
             BROADCAST_SELECT_GROUPS: [
                 CallbackQueryHandler(cb_select_group, pattern="^sel_(?!done)"),
                 CallbackQueryHandler(cb_select_done, pattern="^sel_done$"),
+                CallbackQueryHandler(cb_main_menu, pattern="^main_menu$"),
+            ],
+            BROADCAST_CHOOSE_CONTENT: [
+                CallbackQueryHandler(cb_content_manual, pattern="^content_manual$"),
+                CallbackQueryHandler(cb_content_generate, pattern="^content_generate$"),
+                CallbackQueryHandler(cb_broadcast_start, pattern="^broadcast_start$"),
+                CallbackQueryHandler(cb_main_menu, pattern="^main_menu$"),
+            ],
+            BROADCAST_CHOOSE_ATTACHMENT: [
+                CallbackQueryHandler(cb_attach_yes, pattern="^attach_yes$"),
+                CallbackQueryHandler(cb_attach_no, pattern="^attach_no$"),
+                CallbackQueryHandler(cb_broadcast_start, pattern="^broadcast_start$"),
                 CallbackQueryHandler(cb_main_menu, pattern="^main_menu$"),
             ],
             BROADCAST_WAIT_APK: [
@@ -986,6 +1119,11 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, msg_generate_topic),
                 CallbackQueryHandler(cb_main_menu, pattern="^main_menu$"),
             ],
+            GENERATE_READY: [
+                CallbackQueryHandler(cb_generated_send, pattern="^generated_send$"),
+                CallbackQueryHandler(cb_generate_menu, pattern="^generate_menu$"),
+                CallbackQueryHandler(cb_main_menu, pattern="^main_menu$"),
+            ],
             ADD_USER_WAIT_ID: [
                 MessageHandler(filters.ALL & ~filters.COMMAND, msg_add_user_id),
                 CallbackQueryHandler(cb_users_menu, pattern="^users_menu$"),
@@ -1019,6 +1157,10 @@ def main():
             CallbackQueryHandler(cb_generate_menu, pattern="^generate_menu$"),
             CallbackQueryHandler(cb_select_group, pattern="^sel_(?!done)"),
             CallbackQueryHandler(cb_select_done, pattern="^sel_done$"),
+            CallbackQueryHandler(cb_content_manual, pattern="^content_manual$"),
+            CallbackQueryHandler(cb_content_generate, pattern="^content_generate$"),
+            CallbackQueryHandler(cb_attach_yes, pattern="^attach_yes$"),
+            CallbackQueryHandler(cb_attach_no, pattern="^attach_no$"),
             CallbackQueryHandler(cb_time_now, pattern="^time_now$"),
             CallbackQueryHandler(cb_time_in_30m, pattern="^time_in_30m$"),
             CallbackQueryHandler(cb_time_in_1h, pattern="^time_in_1h$"),
@@ -1028,6 +1170,7 @@ def main():
             CallbackQueryHandler(cb_pick_hour, pattern="^pick_hour_"),
             CallbackQueryHandler(cb_pick_minute, pattern="^pick_min_"),
             CallbackQueryHandler(cb_confirm_yes, pattern="^confirm_yes$"),
+            CallbackQueryHandler(cb_generated_send, pattern="^generated_send$"),
             CallbackQueryHandler(cb_users_menu, pattern="^users_menu$"),
             CallbackQueryHandler(cb_user_list, pattern="^user_list$"),
             CallbackQueryHandler(cb_user_add, pattern="^user_add$"),
