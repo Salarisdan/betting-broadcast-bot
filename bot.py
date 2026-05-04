@@ -32,28 +32,34 @@ anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # ─── Groups storage ───────────────────────────────────────────────────────────
 
+def load_json_file(path: str, legacy_path: str, default):
+    for candidate in (path, legacy_path):
+        if os.path.exists(candidate):
+            with open(candidate, "r", encoding="utf-8") as f:
+                return json.load(f)
+    return default
+
+def save_json_file(path: str, payload):
+    dir_name = os.path.dirname(path)
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
 def load_groups() -> dict:
-    if os.path.exists(GROUPS_FILE):
-        with open(GROUPS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+    return load_json_file(GROUPS_FILE, "groups.json", {})
 
 def save_groups(groups: dict):
-    with open(GROUPS_FILE, "w", encoding="utf-8") as f:
-        json.dump(groups, f, ensure_ascii=False, indent=2)
+    save_json_file(GROUPS_FILE, groups)
 
 # ─── Users storage ────────────────────────────────────────────────────────────
 
 def load_extra_users() -> list:
     """Load user IDs added via bot (stored in USERS_FILE)."""
-    if os.path.exists(USERS_FILE):
-        with open(USERS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return []
+    return load_json_file(USERS_FILE, "users.json", [])
 
 def save_extra_users(users: list):
-    with open(USERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(users, f, ensure_ascii=False, indent=2)
+    save_json_file(USERS_FILE, users)
 
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 
