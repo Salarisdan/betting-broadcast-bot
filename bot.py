@@ -37,7 +37,8 @@ RESOLVED_ANTHROPIC_MODEL = ANTHROPIC_MODEL
     ADD_USER_WAIT_ID,
     PROCESS_WAIT_POST, PROCESS_CHOOSE_ACTION,
     MATCH_WAIT_DATA,
-) = range(20)
+    SPORT_NEWS_MENU,
+) = range(21)
 
 # ─── Groups storage ───────────────────────────────────────────────────────────
 
@@ -173,7 +174,8 @@ def main_menu_kb(owner: bool = False):
         [InlineKeyboardButton("👥 Управление группами", callback_data="groups_menu")],
         [InlineKeyboardButton("✏️ Сгенерировать пост", callback_data="generate_menu")],
         [InlineKeyboardButton("🔄 Переработать пост", callback_data="process_menu")],
-        [InlineKeyboardButton("⚽ Матч-анализ", callback_data="match_menu")],
+        [InlineKeyboardButton("⚽ Матч-анализ", callback_data="match_menu"),
+         InlineKeyboardButton("🏆 Спорт-новости", callback_data="sport_news_menu")],
     ]
     if owner:
         rows.append([InlineKeyboardButton("🔑 Управление доступом", callback_data="users_menu")])
@@ -259,6 +261,17 @@ def process_action_kb():
         [InlineKeyboardButton("💎 Улучшить стиль", callback_data="proc_improve"),
          InlineKeyboardButton("📢 Пост для канала", callback_data="proc_channel")],
         [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")],
+    ])
+
+def sport_news_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚽ Футбол", callback_data="snews_football"),
+         InlineKeyboardButton("🏆 UFC / MMA", callback_data="snews_ufc")],
+        [InlineKeyboardButton("🏒 Хоккей", callback_data="snews_hockey"),
+         InlineKeyboardButton("🏀 Баскетбол", callback_data="snews_basketball")],
+        [InlineKeyboardButton("🎾 Теннис", callback_data="snews_tennis"),
+         InlineKeyboardButton("🥊 Бокс", callback_data="snews_boxing")],
+        [InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu")],
     ])
 
 def schedule_time_kb():
@@ -1162,6 +1175,84 @@ async def cb_proc_improve(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cb_proc_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await _run_process_action(update, context, "channel")
 
+# ─── Sport news flow ─────────────────────────────────────────────────────────
+
+_SPORT_META = {
+    "football":   ("⚽ Футбол",      "football latest results scores goals 2026"),
+    "ufc":        ("🏆 UFC / MMA",   "UFC MMA latest fight results 2026"),
+    "hockey":     ("🏒 Хоккей",      "NHL hockey latest results scores 2026"),
+    "basketball": ("🏀 Баскетбол",   "NBA basketball latest results scores 2026"),
+    "tennis":     ("🎾 Теннис",      "tennis ATP WTA latest results scores 2026"),
+    "boxing":     ("🥊 Бокс",        "boxing latest fight results 2026"),
+}
+
+async def cb_sport_news_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "🏆 *Спорт-новости*\n\n"
+        "Выбери вид спорта — бот найдёт актуальные результаты "
+        "из интернета и сгенерирует пост.",
+        parse_mode="Markdown",
+        reply_markup=sport_news_kb(),
+    )
+    return SPORT_NEWS_MENU
+
+async def _generate_sport_news(update: Update, context: ContextTypes.DEFAULT_TYPE, sport_key: str):
+    q = update.callback_query
+    await q.answer()
+    label, search_query = _SPORT_META[sport_key]
+    await q.edit_message_text(f"⏳ Ищу свежие новости по теме {label}...")
+
+    web_context = await search_web(search_query, max_results=10)
+    web_block = f"\n\nСвежие данные из интернета:\n{web_context}" if web_context else ""
+
+    today = datetime.now().strftime("%d.%m.%Y")
+    prompt = (
+        f"Ты — спортивный журналист Telegram-канала по беттингу. "
+        f"Сегодня {today}. Напиши свежий новостной пост по теме «{label}» на русском языке.\n\n"
+        "Пост должен содержать:\n"
+        "- Заголовок с датой\n"
+        "- 3–5 самых важных результатов / матчей (счёт, победитель, кто забил/отличился)\n"
+        "- Короткий комментарий к каждому результату\n"
+        "- Что это значит для турнирной таблицы / плей-офф / дальнейших ставок\n"
+        "- Ближайшие топ-матчи которые стоит смотреть\n\n"
+        "Стиль: живой, динамичный, умеренные эмодзи. 250–400 слов. Без хэштегов."
+        f"{web_block}"
+    )
+    try:
+        result = await call_claude(prompt, max_tokens=2048)
+        context.user_data["generated_post"] = {"text": result, "entities": None}
+        await q.edit_message_text(
+            f"✅ {label} — новости готовы:\n\n{result}",
+            reply_markup=generated_post_kb(),
+        )
+        return GENERATE_READY
+    except Exception as e:
+        await q.edit_message_text(
+            f"❌ Ошибка: {e}",
+            reply_markup=main_menu_kb(is_owner(update.effective_user.id)),
+        )
+        return MAIN_MENU
+
+async def cb_snews_football(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await _generate_sport_news(update, context, "football")
+
+async def cb_snews_ufc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await _generate_sport_news(update, context, "ufc")
+
+async def cb_snews_hockey(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await _generate_sport_news(update, context, "hockey")
+
+async def cb_snews_basketball(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await _generate_sport_news(update, context, "basketball")
+
+async def cb_snews_tennis(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await _generate_sport_news(update, context, "tennis")
+
+async def cb_snews_boxing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await _generate_sport_news(update, context, "boxing")
+
 # ─── Match analysis flow ───────────────────────────────────────────────────────
 
 async def cb_match_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1262,6 +1353,13 @@ def main():
             CallbackQueryHandler(cb_proc_translate, pattern="^proc_translate$"),
             CallbackQueryHandler(cb_proc_improve, pattern="^proc_improve$"),
             CallbackQueryHandler(cb_proc_channel, pattern="^proc_channel$"),
+            CallbackQueryHandler(cb_sport_news_menu, pattern="^sport_news_menu$"),
+            CallbackQueryHandler(cb_snews_football, pattern="^snews_football$"),
+            CallbackQueryHandler(cb_snews_ufc, pattern="^snews_ufc$"),
+            CallbackQueryHandler(cb_snews_hockey, pattern="^snews_hockey$"),
+            CallbackQueryHandler(cb_snews_basketball, pattern="^snews_basketball$"),
+            CallbackQueryHandler(cb_snews_tennis, pattern="^snews_tennis$"),
+            CallbackQueryHandler(cb_snews_boxing, pattern="^snews_boxing$"),
         ],
         states={
             ADD_GROUP_WAIT_ID: [
@@ -1351,6 +1449,15 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, msg_match_data),
                 CallbackQueryHandler(cb_main_menu, pattern="^main_menu$"),
             ],
+            SPORT_NEWS_MENU: [
+                CallbackQueryHandler(cb_snews_football, pattern="^snews_football$"),
+                CallbackQueryHandler(cb_snews_ufc, pattern="^snews_ufc$"),
+                CallbackQueryHandler(cb_snews_hockey, pattern="^snews_hockey$"),
+                CallbackQueryHandler(cb_snews_basketball, pattern="^snews_basketball$"),
+                CallbackQueryHandler(cb_snews_tennis, pattern="^snews_tennis$"),
+                CallbackQueryHandler(cb_snews_boxing, pattern="^snews_boxing$"),
+                CallbackQueryHandler(cb_main_menu, pattern="^main_menu$"),
+            ],
             ADD_USER_WAIT_ID: [
                 MessageHandler(filters.ALL & ~filters.COMMAND, msg_add_user_id),
                 CallbackQueryHandler(cb_users_menu, pattern="^users_menu$"),
@@ -1372,6 +1479,7 @@ def main():
                 CallbackQueryHandler(cb_user_delete, pattern="^delusr_"),
                 CallbackQueryHandler(cb_process_menu, pattern="^process_menu$"),
                 CallbackQueryHandler(cb_match_menu, pattern="^match_menu$"),
+                CallbackQueryHandler(cb_sport_news_menu, pattern="^sport_news_menu$"),
             ],
         },
         fallbacks=[
@@ -1406,6 +1514,13 @@ def main():
             CallbackQueryHandler(cb_proc_translate, pattern="^proc_translate$"),
             CallbackQueryHandler(cb_proc_improve, pattern="^proc_improve$"),
             CallbackQueryHandler(cb_proc_channel, pattern="^proc_channel$"),
+            CallbackQueryHandler(cb_sport_news_menu, pattern="^sport_news_menu$"),
+            CallbackQueryHandler(cb_snews_football, pattern="^snews_football$"),
+            CallbackQueryHandler(cb_snews_ufc, pattern="^snews_ufc$"),
+            CallbackQueryHandler(cb_snews_hockey, pattern="^snews_hockey$"),
+            CallbackQueryHandler(cb_snews_basketball, pattern="^snews_basketball$"),
+            CallbackQueryHandler(cb_snews_tennis, pattern="^snews_tennis$"),
+            CallbackQueryHandler(cb_snews_boxing, pattern="^snews_boxing$"),
             CallbackQueryHandler(cb_users_menu, pattern="^users_menu$"),
             CallbackQueryHandler(cb_user_list, pattern="^user_list$"),
             CallbackQueryHandler(cb_user_add, pattern="^user_add$"),
