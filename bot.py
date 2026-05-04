@@ -200,6 +200,32 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 Бот для рассылки постов в группы", reply_markup=main_menu_kb())
     return MAIN_MENU
 
+async def cmd_register_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual fallback: run /register inside target group/channel to save it."""
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not chat:
+        return
+
+    if chat.type not in ("group", "supergroup", "channel"):
+        if update.message:
+            await update.message.reply_text("Эту команду нужно запускать внутри группы/канала.")
+        return
+
+    # In groups, keep access control. In channels user may be unavailable.
+    if chat.type in ("group", "supergroup") and user and not is_allowed(user.id):
+        return
+
+    chat_id = str(chat.id)
+    name = chat.title or chat.username or chat_id
+    groups = load_groups()
+    groups[chat_id] = name
+    save_groups(groups)
+
+    if update.message:
+        await update.message.reply_text("✅ Группа сохранена. Теперь можешь запускать рассылку из лички с ботом.")
+
 # ─── Callbacks: navigation ────────────────────────────────────────────────────
 
 async def cb_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -266,7 +292,8 @@ async def cb_group_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1️⃣ Добавь бота в группу/канал как администратора — "
         "группа сохранится автоматически.\n\n"
         "2️⃣ Или перешли сюда любое сообщение из группы/канала:\n"
-        "   (нажми на сообщение → Переслать → выбери этот бот)",
+        "   (нажми на сообщение → Переслать → выбери этот бот)\n\n"
+        "3️⃣ Если бот уже добавлен, открой ту группу и отправь команду /register",
         reply_markup=back_kb("groups_menu")
     )
     return ADD_GROUP_WAIT_ID
@@ -351,7 +378,14 @@ async def cb_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await q.answer()
     groups = load_groups()
     if not groups:
-        await q.edit_message_text("❌ Нет групп. Сначала добавь группы.", reply_markup=groups_menu_kb())
+        await q.edit_message_text(
+            "❌ Нет сохраненных групп.\n\n"
+            "Что сделать:\n"
+            "1) Добавь бота в группу как администратора\n"
+            "2) В этой группе отправь /register\n"
+            "3) Вернись и создай рассылку",
+            reply_markup=groups_menu_kb(),
+        )
         return MAIN_MENU
     context.user_data["broadcast"] = {"selected": set()}
     await q.edit_message_text("Выбери группы для рассылки:", reply_markup=select_groups_kb(groups, set()))
@@ -676,6 +710,8 @@ async def msg_generate_topic(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("register", cmd_register_group))
 
     conv = ConversationHandler(
         entry_points=[
