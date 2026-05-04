@@ -410,7 +410,9 @@ async def msg_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = await update.message.reply_text("⏳ Генерирую через Claude...")
         try:
             generated = await generate_post_text(topic)
-            get_bd(context)["post_text"] = generated
+            data = get_bd(context)
+            data["post_text"] = generated
+            data["post_entities"] = None
             await msg.edit_text(
                 f"✅ Готово:\n\n{generated}\n\n"
                 "Сколько раз отправить в каждую группу? (введи число):"
@@ -420,7 +422,10 @@ async def msg_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(f"❌ Ошибка: {e}")
             return BROADCAST_WAIT_TEXT
 
-    get_bd(context)["post_text"] = text
+    data = get_bd(context)
+    data["post_text"] = text
+    # Preserve inline entities from Telegram editor (e.g. attached links)
+    data["post_entities"] = tuple(update.message.entities) if update.message.entities else None
     await update.message.reply_text("Сколько раз отправить пост в каждую группу? (введи число):")
     return BROADCAST_WAIT_COUNT
 
@@ -627,6 +632,7 @@ async def cb_confirm_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=gid,
                     document=data["apk_file_id"],
                     caption=data["post_text"],
+                    caption_entities=data.get("post_entities"),
                 )
                 sent += 1
                 await asyncio.sleep(1)
