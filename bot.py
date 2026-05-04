@@ -12,6 +12,8 @@ from telegram.ext import (
 )
 from config import TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY, ANTHROPIC_MODEL, ALLOWED_USER_IDS, GROUPS_FILE, USERS_FILE
 import anthropic
+import aiohttp
+import feedparser
 try:
     from duckduckgo_search import DDGS
     _DDG_AVAILABLE = True
@@ -158,6 +160,59 @@ async def search_news(query: str, max_results: int = 10) -> str:
             if url:
                 line += f"\n  {url}"
             lines.append(line)
+    return "\n\n".join(lines)
+
+
+async def fetch_rss_news(urls: list[str], max_items: int = 8) -> str:
+    """
+    Fetch RSS feeds and return formatted recent articles with publish dates.
+    Far more reliable than web search for sports results.
+    """
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; SportNewsBot/1.0)"}
+    all_entries = []
+
+    async def _fetch_one(url: str):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                    if resp.status == 200:
+                        content = await resp.text()
+                        feed = await asyncio.to_thread(feedparser.parse, content)
+                        return feed.entries[:max_items]
+        except Exception as exc:
+            logger.warning(f"RSS fetch failed for {url}: {exc}")
+        return []
+
+    results = await asyncio.gather(*[_fetch_one(u) for u in urls])
+    for entries in results:
+        all_entries.extend(entries)
+
+    if not all_entries:
+        return ""
+
+    lines = []
+    for e in all_entries[:15]:
+        title = e.get("title", "").strip()
+        summary = e.get("summary", "").strip()
+        published = e.get("published", "").strip()
+        link = e.get("link", "").strip()
+        source = e.get("source", {}).get("title", "")
+        if not title:
+            continue
+        line = f"[{published}]"
+        if source:
+            line += f" {source}:"
+        line += f" {title}"
+        if summary:
+            # strip HTML tags simply
+            import re
+            summary_clean = re.sub(r"<[^>]+>", "", summary)[:200].strip()
+            if summary_clean:
+                line += f"\n  {summary_clean}"
+        if link:
+            line += f"\n  {link}"
+        lines.append(line)
+
     return "\n\n".join(lines)
 
 
@@ -1216,12 +1271,33 @@ async def cb_proc_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── Sport news flow ─────────────────────────────────────────────────────────
 
 _SPORT_META = {
-    "football":   ("⚽ Футбол",      ["football results scores today", "soccer results today Premier League LaLiga Serie A"]),
-    "ufc":        ("🏆 UFC / MMA",   ["UFC MMA results this week", "UFC fight night results"]),
-    "hockey":     ("🏒 Хоккей",      ["NHL hockey results today", "NHL scores tonight"]),
-    "basketball": ("🏀 Баскетбол",   ["NBA basketball results today", "NBA scores tonight"]),
-    "tennis":     ("🎾 Теннис",      ["tennis results today ATP WTA", "tennis scores today"]),
-    "boxing":     ("🥊 Бокс",        ["boxing results this week", "boxing fight results"]),
+    "football": ("⚽ Футбол", [
+        "https://feeds.bbci.co.uk/sport/football/rss.xml",
+        "https://www.espn.com/espn/rss/soccer/news",
+        "https://www.goal.com/feeds/en/news",
+    ]),
+    "ufc": ("🏆 UFC / MMA", [
+        "https://www.espn.com/espn/rss/mma/news",
+        "https://www.mmafighting.com/rss/current",
+        "https://www.ufc.com/rss/news",
+    ]),
+    "hockey": ("🏒 Хоккей", [
+        "https://www.espn.com/espn/rss/nhl/news",
+        "https://feeds.bbci.co.uk/sport/winter-sports/rss.xml",
+    ]),
+    "basketball": ("🏀 Баскетбол", [
+        "https://www.espn.com/espn/rss/nba/news",
+        "https://feeds.bbci.co.uk/sport/basketball/rss.xml",
+    ]),
+    "tennis": ("🎾 Теннис", [
+        "https://www.espn.com/espn/rss/tennis/news",
+        "https://feeds.bbci.co.uk/sport/tennis/rss.xml",
+    ]),
+    "boxing": ("🥊 Бокс", [
+        "https://www.espn.com/espn/rss/boxing/news",
+        "https://www.boxingscene.com/feed",
+        "https://feeds.bbci.co.uk/sport/boxing/rss.xml",
+    ]),
 }
 
 async def cb_sport_news_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1239,42 +1315,52 @@ async def cb_sport_news_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def _generate_sport_news(update: Update, context: ContextTypes.DEFAULT_TYPE, sport_key: str):
     q = update.callback_query
     await q.answer()
-    label, queries = _SPORT_META[sport_key]
-    await q.edit_message_text(f"⏳ Ищу свежие новости по теме {label}...")
+    label, rss_urls = _SPORT_META[sport_key]
+    await q.edit_message_text(f"⏳ Получаю свежие новости по теме {label}...")
 
     today = datetime.now().strftime("%d.%m.%Y")
 
-    # Run all queries via news search in parallel
-    news_results = await asyncio.gather(*[search_news(q_str, max_results=8) for q_str in queries])
-    all_snippets = "\n\n".join(r for r in news_results if r)
+    # Fetch from RSS feeds — real timestamps, no caching issues
+    rss_data = await fetch_rss_news(rss_urls, max_items=6)
 
-    if not all_snippets:
+    # Fallback to DDG news if RSS failed
+    if not rss_data:
+        ddg_queries = {
+            "football": "football soccer results today",
+            "ufc": "UFC MMA fight results",
+            "hockey": "NHL hockey results today",
+            "basketball": "NBA results today",
+            "tennis": "tennis results today",
+            "boxing": "boxing fight results",
+        }
+        rss_data = await search_news(ddg_queries[sport_key], max_results=10)
+
+    if not rss_data:
         await q.edit_message_text(
-            f"❌ Не нашёл свежих новостей по теме «{label}».\n\n"
-            "Попробуй позже — возможно, матчей сегодня нет или источники временно недоступны.",
+            f"❌ Не удалось получить новости по «{label}».\n"
+            "Источники временно недоступны, попробуй через несколько минут.",
             reply_markup=sport_news_kb(),
         )
         return SPORT_NEWS_MENU
 
     prompt = (
         f"Сегодня {today}.\n\n"
-        "НОВОСТИ ИЗ ИНТЕРНЕТА (свежие статьи с датами публикации):\n"
-        "═══════════════════════════════════════\n"
-        f"{all_snippets}\n"
-        "═══════════════════════════════════════\n\n"
+        "СВЕЖИЕ НОВОСТИ ИЗ RSS-ЛЕНТ (с датами публикации):\n"
+        "══════════════════════════════════════════════\n"
+        f"{rss_data}\n"
+        "══════════════════════════════════════════════\n\n"
         f"ЗАДАЧА: Напиши новостной пост для Telegram-канала по теме «{label}» на русском языке.\n\n"
-        "ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА:\n"
-        "1. Используй ТОЛЬКО факты из новостей выше. Никакой отсебятины\n"
-        "2. Все результаты, имена и счета — строго из источников выше\n"
-        "3. Если в источниках нет конкретного матча — не упоминай его\n"
-        "4. Указывай источник или дату публикации где это уместно\n"
-        "5. Если информация устарела (старше 3 дней) — предупреди об этом\n\n"
+        "СТРОГИЕ ПРАВИЛА:\n"
+        "1. Используй ИСКЛЮЧИТЕЛЬНО события из новостей выше — ничего из своей памяти\n"
+        "2. Если в новостях есть конкретные счета/результаты — указывай их точно\n"
+        "3. Обращай внимание на даты — пиши только о свежих событиях\n"
+        "4. Если новостей мало — сделай короткий пост, не выдумывай события\n\n"
         "СТРУКТУРА:\n"
         f"- Заголовок: «{label} | {today}»\n"
-        "- 3–5 ключевых результатов из новостей выше\n"
-        "- Краткий анализ: что значит для таблицы / ставок\n"
-        "- Ближайшие события\n\n"
-        "Стиль: живой, умеренные эмодзи. 250–400 слов. Без хэштегов."
+        "- Ключевые результаты и события из новостей выше\n"
+        "- Краткий комментарий: что это значит для таблицы / ставок\n"
+        "- Что предстоит\n\n"
+        "Стиль: живой, умеренные эмодзи. До 400 слов. Без хэштегов."
     )
     try:
         result = await call_claude(prompt, max_tokens=2048)
