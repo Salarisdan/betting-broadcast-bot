@@ -30,7 +30,9 @@ RESOLVED_ANTHROPIC_MODEL = ANTHROPIC_MODEL
     BROADCAST_PICK_HOUR, BROADCAST_PICK_MINUTE, BROADCAST_CONFIRM,
     GENERATE_WAIT_TOPIC, GENERATE_READY,
     ADD_USER_WAIT_ID,
-) = range(17)
+    PROCESS_WAIT_POST, PROCESS_CHOOSE_ACTION,
+    MATCH_WAIT_DATA,
+) = range(20)
 
 # ─── Groups storage ───────────────────────────────────────────────────────────
 
@@ -85,17 +87,8 @@ def is_allowed(user_id: int) -> bool:
 
 # ─── Claude generation ────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """Ты — эксперт по беттингу и гемблингу. Пишешь посты для Telegram.
-Правила:
-- Живой текст с характером, не сухой
-- Умеренные эмодзи
-- 150–300 слов
-- Разные форматы: советы, стратегии, факты, психология, аналитика
-- Не рекламируй конкретные бренды
-- Только русский язык
-- Без хэштегов"""
-
-async def generate_post_text(topic: str) -> str:
+async def call_claude(prompt: str, max_tokens: int = 2048) -> str:
+    """Call Claude with a fully-formed prompt string."""
     global RESOLVED_ANTHROPIC_MODEL
 
     candidate_models = [
@@ -110,22 +103,30 @@ async def generate_post_text(topic: str) -> str:
         try:
             message = anthropic_client.messages.create(
                 model=model_name,
-                max_tokens=1024,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": f"Напиши пост на тему: {topic}"}]
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}]
             )
             RESOLVED_ANTHROPIC_MODEL = model_name
             return message.content[0].text
         except Exception as e:
             last_error = e
             error_text = str(e)
-            # If the model name is invalid in this account, try the next known alias.
             if "not_found_error" in error_text or "model:" in error_text:
                 logger.warning(f"Anthropic model unavailable: {model_name}")
                 continue
             raise
 
     raise RuntimeError(f"Не удалось подобрать рабочую модель Claude: {last_error}")
+
+
+async def generate_post_text(topic: str) -> str:
+    system = (
+        "Ты — эксперт по беттингу и гемблингу. Пишешь посты для Telegram.\n"
+        "Правила:\n- Живой текст с характером, не сухой\n- Умеренные эмодзи\n"
+        "- 150–300 слов\n- Разные форматы: советы, стратегии, факты, психология, аналитика\n"
+        "- Не рекламируй конкретные бренды\n- Только русский язык\n- Без хэштегов"
+    )
+    return await call_claude(f"{system}\n\nНапиши пост на тему: {topic}")
 
 # ─── Keyboards ────────────────────────────────────────────────────────────────
 
@@ -134,6 +135,8 @@ def main_menu_kb(owner: bool = False):
         [InlineKeyboardButton("📤 Создать рассылку", callback_data="broadcast_start")],
         [InlineKeyboardButton("👥 Управление группами", callback_data="groups_menu")],
         [InlineKeyboardButton("✏️ Сгенерировать пост", callback_data="generate_menu")],
+        [InlineKeyboardButton("🔄 Переработать пост", callback_data="process_menu")],
+        [InlineKeyboardButton("⚽ Матч-анализ", callback_data="match_menu")],
     ]
     if owner:
         rows.append([InlineKeyboardButton("🔑 Управление доступом", callback_data="users_menu")])
@@ -210,6 +213,15 @@ def generated_post_kb():
         [InlineKeyboardButton("📤 Отправить в группы", callback_data="generated_send")],
         [InlineKeyboardButton("🔁 Сгенерировать ещё", callback_data="generate_menu")],
         [InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu")],
+    ])
+
+def process_action_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔁 Рерайт", callback_data="proc_rewrite"),
+         InlineKeyboardButton("🌍 Перевести на RU", callback_data="proc_translate")],
+        [InlineKeyboardButton("💎 Улучшить стиль", callback_data="proc_improve"),
+         InlineKeyboardButton("📢 Пост для канала", callback_data="proc_channel")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")],
     ])
 
 def schedule_time_kb():
@@ -1024,6 +1036,153 @@ async def cb_generated_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text("Выбери группы для рассылки:", reply_markup=select_groups_kb(groups, set()))
     return BROADCAST_SELECT_GROUPS
 
+# ─── Process / rewrite flow ──────────────────────────────────────────────────
+
+async def cb_process_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "🔄 *Переработка поста через Claude*\n\n"
+        "Перешли сообщение из любого канала или группы — "
+        "бот обработает его через AI.\n\n"
+        "Или просто напиши свой текст.",
+        parse_mode="Markdown",
+        reply_markup=back_kb("main_menu"),
+    )
+    return PROCESS_WAIT_POST
+
+async def msg_process_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    source_text = (update.message.text or update.message.caption or "").strip()
+    if not source_text:
+        await update.message.reply_text(
+            "❌ Не нашёл текст. Перешли пост с текстом или напиши вручную.",
+            reply_markup=back_kb("main_menu"),
+        )
+        return PROCESS_WAIT_POST
+    context.user_data["process_source"] = source_text
+    await update.message.reply_text(
+        f"✅ Текст получен ({len(source_text)} симв.). Что сделать?",
+        reply_markup=process_action_kb(),
+    )
+    return PROCESS_CHOOSE_ACTION
+
+async def _run_process_action(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str):
+    q = update.callback_query
+    await q.answer()
+    source = context.user_data.get("process_source", "")
+    if not source:
+        await q.edit_message_text(
+            "❌ Сначала отправь текст для обработки.",
+            reply_markup=main_menu_kb(is_owner(update.effective_user.id)),
+        )
+        return MAIN_MENU
+    prompts = {
+        "rewrite": (
+            "Сделай рерайт этого Telegram-поста. Сохрани смысл, но измени структуру "
+            "и формулировки. Стиль — живой, разговорный, для аудитории беттеров.\n\n"
+            f"Оригинал:\n{source}"
+        ),
+        "translate": (
+            "Переведи этот пост на русский язык. Сохрани стиль, структуру и эмодзи. "
+            "Результат — только перевод, без пояснений.\n\n"
+            f"Оригинал:\n{source}"
+        ),
+        "improve": (
+            "Улучши этот Telegram-пост: сделай более привлекательным и живым, "
+            "добавь эмодзи там где уместно, исправь стиль, сохрани смысл.\n\n"
+            f"Оригинал:\n{source}"
+        ),
+        "channel": (
+            "Преобразуй этот текст в готовый пост для Telegram-канала по беттингу/гемблингу. "
+            "Добавь структуру, эмодзи, заголовок, сделай текст продающим и вовлекающим.\n\n"
+            f"Оригинал:\n{source}"
+        ),
+    }
+    await q.edit_message_text("⏳ Обрабатываю через Claude...")
+    try:
+        result = await call_claude(prompts[mode])
+        context.user_data["generated_post"] = {"text": result, "entities": None}
+        await q.edit_message_text(f"✅ Готово:\n\n{result}", reply_markup=generated_post_kb())
+        return GENERATE_READY
+    except Exception as e:
+        await q.edit_message_text(
+            f"❌ Ошибка: {e}",
+            reply_markup=main_menu_kb(is_owner(update.effective_user.id)),
+        )
+        return MAIN_MENU
+
+async def cb_proc_rewrite(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await _run_process_action(update, context, "rewrite")
+
+async def cb_proc_translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await _run_process_action(update, context, "translate")
+
+async def cb_proc_improve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await _run_process_action(update, context, "improve")
+
+async def cb_proc_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await _run_process_action(update, context, "channel")
+
+# ─── Match analysis flow ───────────────────────────────────────────────────────
+
+async def cb_match_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "⚽ *Матч-анализ*\n\n"
+        "Введи данные матча в свободной форме — "
+        "Claude составит полный аналитический пост.\n\n"
+        "Пример:\n"
+        "`Реал Мадрид — Барселона`\n"
+        "`Дата: 12.05.2026 22:00`\n"
+        "`Кеф Реал: 2.10 | Ничья: 3.50 | Кеф Барса: 3.20`\n"
+        "`Турнир: Ла Лига`\n"
+        "`Инсайды: Вальверде под вопросом, Барса без Педри`\n\n"
+        "Можно указать только то что есть — дату, турнир и инсайды необязательны.",
+        parse_mode="Markdown",
+        reply_markup=back_kb("main_menu"),
+    )
+    return MATCH_WAIT_DATA
+
+async def msg_match_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    raw = update.message.text.strip()
+    if not raw:
+        await update.message.reply_text(
+            "❌ Введи данные матча.", reply_markup=back_kb("main_menu")
+        )
+        return MATCH_WAIT_DATA
+    msg = await update.message.reply_text("⏳ Генерирую анализ через Claude...")
+    prompt = (
+        "Ты — профессиональный беттинговый аналитик. Составь детальный пост-анализ матча "
+        "для Telegram-канала на русском языке.\n\n"
+        f"Данные матча:\n{raw}\n\n"
+        "Структура поста:\n"
+        "1. 🏟 Заголовок: команды, дата, турнир\n"
+        "2. 📊 Краткая форма и характеристика обеих команд\n"
+        "3. ⚖️ Сравнение: ключевые факторы матча, кто фаворит и почему\n"
+        "4. 💰 Коэффициенты: прокомментируй каждый — есть ли value-ставка\n"
+        "5. 🔍 Инсайды и дополнительные факторы (если предоставлены)\n"
+        "6. 🎯 Рекомендованная ставка с обоснованием\n"
+        "7. 🏆 Итоговый прогноз победителя одной строкой\n\n"
+        "Стиль: уверенный, экспертный, живой. Умеренные эмодзи. "
+        "Длина 400–600 слов. Без хэштегов."
+    )
+    try:
+        result = await call_claude(prompt, max_tokens=2048)
+        context.user_data["generated_post"] = {"text": result, "entities": None}
+        await msg.edit_text(f"✅ Анализ готов:\n\n{result}", reply_markup=generated_post_kb())
+        return GENERATE_READY
+    except Exception as e:
+        await msg.edit_text(
+            f"❌ Ошибка: {e}",
+            reply_markup=main_menu_kb(is_owner(update.effective_user.id)),
+        )
+        return MAIN_MENU
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -1050,6 +1209,12 @@ def main():
             CallbackQueryHandler(cb_user_add, pattern="^user_add$"),
             CallbackQueryHandler(cb_user_delete_list, pattern="^user_delete_list$"),
             CallbackQueryHandler(cb_user_delete, pattern="^delusr_"),
+            CallbackQueryHandler(cb_process_menu, pattern="^process_menu$"),
+            CallbackQueryHandler(cb_match_menu, pattern="^match_menu$"),
+            CallbackQueryHandler(cb_proc_rewrite, pattern="^proc_rewrite$"),
+            CallbackQueryHandler(cb_proc_translate, pattern="^proc_translate$"),
+            CallbackQueryHandler(cb_proc_improve, pattern="^proc_improve$"),
+            CallbackQueryHandler(cb_proc_channel, pattern="^proc_channel$"),
         ],
         states={
             ADD_GROUP_WAIT_ID: [
@@ -1124,6 +1289,21 @@ def main():
                 CallbackQueryHandler(cb_generate_menu, pattern="^generate_menu$"),
                 CallbackQueryHandler(cb_main_menu, pattern="^main_menu$"),
             ],
+            PROCESS_WAIT_POST: [
+                MessageHandler(filters.ALL & ~filters.COMMAND, msg_process_receive),
+                CallbackQueryHandler(cb_main_menu, pattern="^main_menu$"),
+            ],
+            PROCESS_CHOOSE_ACTION: [
+                CallbackQueryHandler(cb_proc_rewrite, pattern="^proc_rewrite$"),
+                CallbackQueryHandler(cb_proc_translate, pattern="^proc_translate$"),
+                CallbackQueryHandler(cb_proc_improve, pattern="^proc_improve$"),
+                CallbackQueryHandler(cb_proc_channel, pattern="^proc_channel$"),
+                CallbackQueryHandler(cb_main_menu, pattern="^main_menu$"),
+            ],
+            MATCH_WAIT_DATA: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, msg_match_data),
+                CallbackQueryHandler(cb_main_menu, pattern="^main_menu$"),
+            ],
             ADD_USER_WAIT_ID: [
                 MessageHandler(filters.ALL & ~filters.COMMAND, msg_add_user_id),
                 CallbackQueryHandler(cb_users_menu, pattern="^users_menu$"),
@@ -1143,6 +1323,8 @@ def main():
                 CallbackQueryHandler(cb_user_add, pattern="^user_add$"),
                 CallbackQueryHandler(cb_user_delete_list, pattern="^user_delete_list$"),
                 CallbackQueryHandler(cb_user_delete, pattern="^delusr_"),
+                CallbackQueryHandler(cb_process_menu, pattern="^process_menu$"),
+                CallbackQueryHandler(cb_match_menu, pattern="^match_menu$"),
             ],
         },
         fallbacks=[
@@ -1171,6 +1353,12 @@ def main():
             CallbackQueryHandler(cb_pick_minute, pattern="^pick_min_"),
             CallbackQueryHandler(cb_confirm_yes, pattern="^confirm_yes$"),
             CallbackQueryHandler(cb_generated_send, pattern="^generated_send$"),
+            CallbackQueryHandler(cb_process_menu, pattern="^process_menu$"),
+            CallbackQueryHandler(cb_match_menu, pattern="^match_menu$"),
+            CallbackQueryHandler(cb_proc_rewrite, pattern="^proc_rewrite$"),
+            CallbackQueryHandler(cb_proc_translate, pattern="^proc_translate$"),
+            CallbackQueryHandler(cb_proc_improve, pattern="^proc_improve$"),
+            CallbackQueryHandler(cb_proc_channel, pattern="^proc_channel$"),
             CallbackQueryHandler(cb_users_menu, pattern="^users_menu$"),
             CallbackQueryHandler(cb_user_list, pattern="^user_list$"),
             CallbackQueryHandler(cb_user_add, pattern="^user_add$"),
