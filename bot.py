@@ -4,9 +4,11 @@ import os
 import asyncio
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import ChatMemberUpdated
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ContextTypes, ConversationHandler, filters
+    MessageHandler, ContextTypes, ConversationHandler, filters,
+    ChatMemberHandler
 )
 from config import TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY, ALLOWED_USER_IDS, GROUPS_FILE
 import anthropic
@@ -153,15 +155,44 @@ async def cb_group_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Callbacks: add group ─────────────────────────────────────────────────────
 
+# ─── Auto-save group when bot is added ───────────────────────────────────────
+
+async def on_bot_added_to_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Automatically save group when bot is added as member/admin."""
+    result: ChatMemberUpdated = update.my_chat_member
+    if not result:
+        return
+    new_status = result.new_chat_member.status
+    # bot was added (member or admin)
+    if new_status in ("member", "administrator"):
+        chat = result.chat
+        if chat.type in ("group", "supergroup", "channel"):
+            chat_id = str(chat.id)
+            name = chat.title or chat.username or chat_id
+            groups = load_groups()
+            if chat_id not in groups:
+                groups[chat_id] = name
+                save_groups(groups)
+                logger.info(f"Auto-saved group: {name} ({chat_id})")
+                # Notify all allowed users
+                for uid in ALLOWED_USER_IDS:
+                    try:
+                        await context.bot.send_message(
+                            uid,
+                            f"✅ Бот добавлен в группу и она сохранена:\n{name}"
+                        )
+                    except Exception:
+                        pass
+
 async def cb_group_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     await q.edit_message_text(
-        "Отправь ссылку-приглашение в группу/канал.\n\n"
-        "Примеры:\n"
-        "https://t.me/+Bgtk-OaAiVs0NmVi\n"
-        "https://t.me/joinchat/XXXXXX\n"
-        "https://t.me/username",
+        "Как добавить группу:\n\n"
+        "1️⃣ Добавь бота в группу/канал как администратора — "
+        "группа сохранится автоматически.\n\n"
+        "2️⃣ Или перешли сюда любое сообщение из группы/канала:\n"
+        "   (нажми на сообщение → Переслать → выбери этот бот)",
         reply_markup=back_kb("groups_menu")
     )
     return ADD_GROUP_WAIT_ID
@@ -170,33 +201,43 @@ async def msg_add_group_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
 
-    text = update.message.text.strip() if update.message.text else ""
+    chat_id = None
+    name = ""
 
-    # Проверяем что это ссылка Telegram
-    if not (text.startswith("https://t.me/") or text.startswith("http://t.me/")):
+    # Forwarded message from a channel/group
+    if update.message.forward_origin:
+        origin = update.message.forward_origin
+        if hasattr(origin, "chat"):
+            chat_id = str(origin.chat.id)
+            name = origin.chat.title or origin.chat.username or chat_id
+
+    # @username or numeric id typed manually
+    if not chat_id and update.message.text:
+        text = update.message.text.strip()
+        if text.startswith("@") or text.lstrip("-").isdigit():
+            # Try to get chat info
+            try:
+                chat = await context.bot.get_chat(text)
+                chat_id = str(chat.id)
+                name = chat.title or chat.username or chat_id
+            except Exception as e:
+                await update.message.reply_text(
+                    f"❌ Не удалось получить инфо о чате: {e}\n"
+                    "Убедись что бот уже состоит в этой группе."
+                )
+                return ADD_GROUP_WAIT_ID
+
+    if not chat_id:
         await update.message.reply_text(
-            "❌ Не распознал. Отправь ссылку вида:\nhttps://t.me/+XXXXXX"
+            "❌ Не распознал. Перешли сообщение из группы или отправь @username"
         )
         return ADD_GROUP_WAIT_ID
 
-    wait_msg = await update.message.reply_text("⏳ Вступаю в группу...")
-    try:
-        chat = await context.bot.join_chat(text)
-        chat_id = str(chat.id)
-        name = chat.title or chat.username or chat_id
-        groups = load_groups()
-        groups[chat_id] = name
-        save_groups(groups)
-        await wait_msg.edit_text(f"✅ Группа добавлена: {name}", reply_markup=groups_menu_kb())
-        return MAIN_MENU
-    except Exception as e:
-        logger.error(f"join_chat error: {e}")
-        await wait_msg.edit_text(
-            f"❌ Не удалось вступить: {e}\n\n"
-            "Убедись что ссылка действующая и бот ещё не состоит в этой группе.",
-            reply_markup=back_kb("groups_menu")
-        )
-        return ADD_GROUP_WAIT_ID
+    groups = load_groups()
+    groups[chat_id] = name
+    save_groups(groups)
+    await update.message.reply_text(f"✅ Группа добавлена: {name}", reply_markup=groups_menu_kb())
+    return MAIN_MENU
 
 async def msg_add_group_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
@@ -539,6 +580,8 @@ def main():
     )
 
     app.add_handler(conv)
+    # Auto-save groups when bot is added to them (outside conversation)
+    app.add_handler(ChatMemberHandler(on_bot_added_to_chat, ChatMemberHandler.MY_CHAT_MEMBER))
     logger.info("Bot started")
     app.run_polling()
 
