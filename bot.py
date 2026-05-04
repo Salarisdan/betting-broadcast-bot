@@ -63,13 +63,17 @@ def is_owner(user_id: int) -> bool:
         return True
     return user_id in ALLOWED_USER_IDS
 
+def _extra_user_ids(users: list) -> list:
+    """Extract just IDs from users list (supports both int and [id, name] formats)."""
+    return [u[0] if isinstance(u, list) else u for u in users]
+
 def is_allowed(user_id: int) -> bool:
     """Owners + extra users added via bot."""
     if not ALLOWED_USER_IDS:
         return True
     if user_id in ALLOWED_USER_IDS:
         return True
-    return user_id in load_extra_users()
+    return user_id in _extra_user_ids(load_extra_users())
 
 # ─── Claude generation ────────────────────────────────────────────────────────
 
@@ -113,7 +117,13 @@ def users_menu_kb():
     ])
 
 def delete_users_kb(users: list):
-    buttons = [[InlineKeyboardButton(f"🗑 {uid}", callback_data=f"delusr_{uid}")] for uid in users]
+    buttons = []
+    for u in users:
+        if isinstance(u, list):
+            uid, name = u[0], u[1]
+        else:
+            uid, name = u, str(u)
+        buttons.append([InlineKeyboardButton(f"🗑 {name}", callback_data=f"delusr_{uid}")])
     buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="users_menu")])
     return InlineKeyboardMarkup(buttons)
 
@@ -430,8 +440,13 @@ async def cb_user_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         return MAIN_MENU
     owners = [str(uid) for uid in ALLOWED_USER_IDS]
-    extra = [str(uid) for uid in load_extra_users()]
-    lines = [f"👑 {uid} (владелец)" for uid in owners] + [f"👤 {uid}" for uid in extra]
+    extra = load_extra_users()
+    lines = [f"👑 {uid} (владелец)" for uid in owners]
+    for u in extra:
+        if isinstance(u, list):
+            lines.append(f"👤 {u[1]} (ID: {u[0]})")
+        else:
+            lines.append(f"👤 ID: {u}")
     text = "📋 Пользователи:\n\n" + "\n".join(lines) if lines else "Нет пользователей"
     await q.edit_message_text(text, reply_markup=users_menu_kb())
     return MAIN_MENU
@@ -443,8 +458,9 @@ async def cb_user_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return MAIN_MENU
     await q.edit_message_text(
         "👤 Добавить пользователя\n\n"
-        "Отправь Telegram ID нового пользователя.\n"
-        "Его ID можно узнать через @userinfobot.",
+        "Отправь @юзернейм пользователя.\n\n"
+        "⚠️ Важно: пользователь должен сначала написать боту /start,\n"
+        "иначе Telegram не позволит найти его ID.",
         reply_markup=back_kb("users_menu")
     )
     return ADD_USER_WAIT_ID
@@ -453,20 +469,38 @@ async def msg_add_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         return
     text = update.message.text.strip() if update.message.text else ""
-    if not text.lstrip("-").isdigit():
-        await update.message.reply_text("❌ Введи числовой Telegram ID", reply_markup=back_kb("users_menu"))
+
+    # Ensure it looks like a username
+    username = text if text.startswith("@") else f"@{text}"
+
+    wait = await update.message.reply_text("⏳ Ищу пользователя...")
+    try:
+        chat = await context.bot.get_chat(username)
+    except Exception:
+        await wait.edit_text(
+            f"❌ Не нашёл пользователя {username}.\n\n"
+            "Убедись что:\n"
+            "1. Юзернейм введён правильно\n"
+            "2. Пользователь хоть раз написал /start этому боту",
+            reply_markup=back_kb("users_menu")
+        )
         return ADD_USER_WAIT_ID
-    new_uid = int(text)
+
+    new_uid = chat.id
+    display = chat.full_name or chat.username or str(new_uid)
+
     if new_uid in ALLOWED_USER_IDS:
-        await update.message.reply_text("ℹ️ Этот пользователь уже владелец.", reply_markup=users_menu_kb())
+        await wait.edit_text(f"ℹ️ {display} уже является владельцем.", reply_markup=users_menu_kb())
         return MAIN_MENU
     users = load_extra_users()
-    if new_uid in users:
-        await update.message.reply_text("ℹ️ Этот пользователь уже добавлен.", reply_markup=users_menu_kb())
+    # users stored as list of [uid, display_name] pairs
+    existing_ids = [u[0] if isinstance(u, list) else u for u in users]
+    if new_uid in existing_ids:
+        await wait.edit_text(f"ℹ️ {display} уже добавлен.", reply_markup=users_menu_kb())
         return MAIN_MENU
-    users.append(new_uid)
+    users.append([new_uid, display])
     save_extra_users(users)
-    await update.message.reply_text(f"✅ Пользователь {new_uid} добавлен.", reply_markup=users_menu_kb())
+    await wait.edit_text(f"✅ {display} ({username}) добавлен.", reply_markup=users_menu_kb())
     return MAIN_MENU
 
 async def cb_user_delete_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -488,9 +522,8 @@ async def cb_user_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return MAIN_MENU
     uid = int(q.data.replace("delusr_", ""))
     users = load_extra_users()
-    if uid in users:
-        users.remove(uid)
-        save_extra_users(users)
+    users = [u for u in users if (u[0] if isinstance(u, list) else u) != uid]
+    save_extra_users(users)
     await q.edit_message_text(f"🗑 Пользователь {uid} удалён.", reply_markup=users_menu_kb())
     return MAIN_MENU
 
