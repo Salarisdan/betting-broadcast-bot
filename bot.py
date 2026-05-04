@@ -24,9 +24,10 @@ anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     ADD_GROUP_WAIT_ID, ADD_GROUP_WAIT_NAME,
     BROADCAST_SELECT_GROUPS, BROADCAST_WAIT_APK,
     BROADCAST_WAIT_TEXT, BROADCAST_WAIT_COUNT,
-    BROADCAST_WAIT_TIME, BROADCAST_CONFIRM,
+    BROADCAST_WAIT_TIME, BROADCAST_PICK_DATE,
+    BROADCAST_PICK_HOUR, BROADCAST_PICK_MINUTE, BROADCAST_CONFIRM,
     GENERATE_WAIT_TOPIC,
-) = range(10)
+) = range(13)
 
 # ─── Groups storage ───────────────────────────────────────────────────────────
 
@@ -110,12 +111,85 @@ def confirm_kb():
         InlineKeyboardButton("❌ Отмена", callback_data="main_menu"),
     ]])
 
+def schedule_time_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚀 Сейчас", callback_data="time_now")],
+        [
+            InlineKeyboardButton("🕒 Через 30 минут", callback_data="time_in_30m"),
+            InlineKeyboardButton("🕐 Через 1 час", callback_data="time_in_1h"),
+        ],
+        [InlineKeyboardButton("📅 Выбрать дату и время", callback_data="time_pick_date")],
+        [InlineKeyboardButton("🔙 В главное меню", callback_data="main_menu")],
+    ])
+
+def pick_date_kb(days: int = 14):
+    now = datetime.now()
+    rows = []
+    row = []
+    for i in range(days):
+        day = now + timedelta(days=i)
+        day_key = day.strftime("%Y%m%d")
+        if i == 0:
+            label = f"Сегодня {day.strftime('%d.%m')}"
+        elif i == 1:
+            label = f"Завтра {day.strftime('%d.%m')}"
+        else:
+            label = day.strftime("%d.%m")
+        row.append(InlineKeyboardButton(label, callback_data=f"pick_day_{day_key}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("🔙 Назад", callback_data="time_back")])
+    return InlineKeyboardMarkup(rows)
+
+def pick_hour_kb(day_key: str):
+    rows = []
+    row = []
+    for hour in range(24):
+        row.append(InlineKeyboardButton(f"{hour:02d}", callback_data=f"pick_hour_{day_key}_{hour:02d}"))
+        if len(row) == 6:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("🔙 К выбору даты", callback_data="time_pick_date")])
+    return InlineKeyboardMarkup(rows)
+
+def pick_minute_kb(day_key: str, hour: str):
+    minutes = ["00", "10", "20", "30", "40", "50"]
+    rows = [[InlineKeyboardButton(m, callback_data=f"pick_min_{day_key}_{hour}_{m}") for m in minutes]]
+    rows.append([InlineKeyboardButton("🔙 К выбору часа", callback_data=f"pick_day_{day_key}")])
+    return InlineKeyboardMarkup(rows)
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def get_bd(context: ContextTypes.DEFAULT_TYPE) -> dict:
     if "broadcast" not in context.user_data:
         context.user_data["broadcast"] = {}
     return context.user_data["broadcast"]
+
+def build_broadcast_summary(data: dict, groups: dict, delay_seconds: float, send_at: datetime | None) -> str:
+    selected_names = [groups.get(gid, gid) for gid in data["selected"]]
+    if delay_seconds == 0:
+        time_str = "немедленно"
+    elif send_at:
+        time_str = send_at.strftime("%d.%m.%Y %H:%M")
+    elif delay_seconds < 3600:
+        time_str = f"через {int(delay_seconds // 60)} мин"
+    else:
+        time_str = f"через {int(delay_seconds // 3600)} ч"
+
+    preview = data["post_text"][:300] + ("..." if len(data["post_text"]) > 300 else "")
+    return (
+        f"📋 *Подтверди рассылку:*\n\n"
+        f"👥 Группы: {', '.join(selected_names)}\n"
+        f"📄 Файл: {data.get('apk_name', '—')}\n"
+        f"🔁 Раз в каждую группу: {data['count']}\n"
+        f"⏰ Время: {time_str}\n\n"
+        f"📝 Текст:\n{preview}"
+    )
 
 # ─── /start ───────────────────────────────────────────────────────────────────
 
@@ -359,14 +433,113 @@ async def msg_receive_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return BROADCAST_WAIT_COUNT
     get_bd(context)["count"] = int(text)
     await update.message.reply_text(
-        "⏰ Когда отправить?\n\n"
-        "• `сейчас`\n"
-        "• `через 30м` / `через 2ч`\n"
-        "• `14:30` — сегодня в это время\n"
-        "• `2025-06-01 10:00` — конкретная дата",
-        parse_mode="Markdown"
+        "⏰ *Шаг 5/5: выбери время отправки*\n\n"
+        "Подсказка: нажми быстрый вариант или выбери точную дату и время.",
+        parse_mode="Markdown",
+        reply_markup=schedule_time_kb(),
     )
     return BROADCAST_WAIT_TIME
+
+async def cb_time_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = get_bd(context)
+    data["delay_seconds"] = 0
+    groups = load_groups()
+    summary = build_broadcast_summary(data, groups, 0, None)
+    await q.edit_message_text(summary, parse_mode="Markdown", reply_markup=confirm_kb())
+    return BROADCAST_CONFIRM
+
+async def cb_time_in_30m(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    delay = 30 * 60
+    data = get_bd(context)
+    data["delay_seconds"] = delay
+    groups = load_groups()
+    summary = build_broadcast_summary(data, groups, delay, None)
+    await q.edit_message_text(summary, parse_mode="Markdown", reply_markup=confirm_kb())
+    return BROADCAST_CONFIRM
+
+async def cb_time_in_1h(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    delay = 60 * 60
+    data = get_bd(context)
+    data["delay_seconds"] = delay
+    groups = load_groups()
+    summary = build_broadcast_summary(data, groups, delay, None)
+    await q.edit_message_text(summary, parse_mode="Markdown", reply_markup=confirm_kb())
+    return BROADCAST_CONFIRM
+
+async def cb_time_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "⏰ *Шаг 5/5: выбери время отправки*\n\n"
+        "Подсказка: нажми быстрый вариант или выбери точную дату и время.",
+        parse_mode="Markdown",
+        reply_markup=schedule_time_kb(),
+    )
+    return BROADCAST_WAIT_TIME
+
+async def cb_time_pick_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "📅 *Выбор даты*\n\n"
+        "Подсказка: сначала выбери день, затем час и минуты.",
+        parse_mode="Markdown",
+        reply_markup=pick_date_kb(),
+    )
+    return BROADCAST_PICK_DATE
+
+async def cb_pick_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    day_key = q.data.replace("pick_day_", "")
+    get_bd(context)["picked_day"] = day_key
+    await q.edit_message_text(
+        f"🕐 *Выбор часа*\n\nДата: {day_key[6:8]}.{day_key[4:6]}.{day_key[:4]}\n"
+        "Подсказка: выбери час в 24-часовом формате.",
+        parse_mode="Markdown",
+        reply_markup=pick_hour_kb(day_key),
+    )
+    return BROADCAST_PICK_HOUR
+
+async def cb_pick_hour(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _, _, day_key, hour = q.data.split("_", 3)
+    data = get_bd(context)
+    data["picked_day"] = day_key
+    data["picked_hour"] = hour
+    await q.edit_message_text(
+        f"🕓 *Выбор минут*\n\nДата: {day_key[6:8]}.{day_key[4:6]}.{day_key[:4]}\n"
+        f"Час: {hour}\n"
+        "Подсказка: выбери минуты (шаг 10 мин).",
+        parse_mode="Markdown",
+        reply_markup=pick_minute_kb(day_key, hour),
+    )
+    return BROADCAST_PICK_MINUTE
+
+async def cb_pick_minute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _, _, day_key, hour, minute = q.data.split("_", 4)
+
+    send_at = datetime.strptime(f"{day_key} {hour}:{minute}", "%Y%m%d %H:%M")
+    delay_seconds = (send_at - datetime.now()).total_seconds()
+    if delay_seconds < 0:
+        await q.answer("⚠️ Это время уже прошло. Выбери другое.", show_alert=True)
+        return BROADCAST_PICK_MINUTE
+
+    data = get_bd(context)
+    data["delay_seconds"] = delay_seconds
+    groups = load_groups()
+    summary = build_broadcast_summary(data, groups, delay_seconds, send_at)
+    await q.edit_message_text(summary, parse_mode="Markdown", reply_markup=confirm_kb())
+    return BROADCAST_CONFIRM
 
 async def msg_receive_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
@@ -549,7 +722,27 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, msg_receive_count),
             ],
             BROADCAST_WAIT_TIME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, msg_receive_time),
+                CallbackQueryHandler(cb_time_now, pattern="^time_now$"),
+                CallbackQueryHandler(cb_time_in_30m, pattern="^time_in_30m$"),
+                CallbackQueryHandler(cb_time_in_1h, pattern="^time_in_1h$"),
+                CallbackQueryHandler(cb_time_pick_date, pattern="^time_pick_date$"),
+                CallbackQueryHandler(cb_time_back, pattern="^time_back$"),
+                CallbackQueryHandler(cb_main_menu, pattern="^main_menu$"),
+            ],
+            BROADCAST_PICK_DATE: [
+                CallbackQueryHandler(cb_pick_day, pattern="^pick_day_"),
+                CallbackQueryHandler(cb_time_back, pattern="^time_back$"),
+                CallbackQueryHandler(cb_main_menu, pattern="^main_menu$"),
+            ],
+            BROADCAST_PICK_HOUR: [
+                CallbackQueryHandler(cb_pick_hour, pattern="^pick_hour_"),
+                CallbackQueryHandler(cb_time_pick_date, pattern="^time_pick_date$"),
+                CallbackQueryHandler(cb_main_menu, pattern="^main_menu$"),
+            ],
+            BROADCAST_PICK_MINUTE: [
+                CallbackQueryHandler(cb_pick_minute, pattern="^pick_min_"),
+                CallbackQueryHandler(cb_pick_day, pattern="^pick_day_"),
+                CallbackQueryHandler(cb_main_menu, pattern="^main_menu$"),
             ],
             BROADCAST_CONFIRM: [
                 CallbackQueryHandler(cb_confirm_yes, pattern="^confirm_yes$"),
@@ -572,6 +765,14 @@ def main():
             CallbackQueryHandler(cb_generate_menu, pattern="^generate_menu$"),
             CallbackQueryHandler(cb_select_group, pattern="^sel_(?!done)"),
             CallbackQueryHandler(cb_select_done, pattern="^sel_done$"),
+            CallbackQueryHandler(cb_time_now, pattern="^time_now$"),
+            CallbackQueryHandler(cb_time_in_30m, pattern="^time_in_30m$"),
+            CallbackQueryHandler(cb_time_in_1h, pattern="^time_in_1h$"),
+            CallbackQueryHandler(cb_time_pick_date, pattern="^time_pick_date$"),
+            CallbackQueryHandler(cb_time_back, pattern="^time_back$"),
+            CallbackQueryHandler(cb_pick_day, pattern="^pick_day_"),
+            CallbackQueryHandler(cb_pick_hour, pattern="^pick_hour_"),
+            CallbackQueryHandler(cb_pick_minute, pattern="^pick_min_"),
             CallbackQueryHandler(cb_confirm_yes, pattern="^confirm_yes$"),
         ],
         per_message=False,
